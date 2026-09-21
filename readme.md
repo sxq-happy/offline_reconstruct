@@ -1,0 +1,1 @@
+.\run_cpp.bat ".\offline_10" ".\offline10_quality\rgb_registered.ply"
