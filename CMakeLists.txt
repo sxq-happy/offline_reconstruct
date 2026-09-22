@@ -48,12 +48,14 @@ find_library(SQLITE3_LIBRARY NAMES sqlite3 PATHS "${CPP_DEPS_ROOT}/lib" REQUIRED
 
 add_executable(offline_reconstruct_cpp
     offline_reconstruct.cpp
+    fast_lio_offline.cpp
     # Upstream BTC descriptor, compiled through the local no-ROS compatibility
     # include path below.  The upstream checkout remains under
     # _deps/btc_descriptor for attribution and auditability; only minimal
     # standalone-build include/diagnostic fixes are applied there.
     _deps/btc_descriptor/src/btc.cpp)
 target_include_directories(offline_reconstruct_cpp PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/_deps/btc_standalone/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/_deps/btc_descriptor"
     "${CMAKE_CURRENT_SOURCE_DIR}/_deps/btc_descriptor/include"

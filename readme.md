@@ -1,1 +1,1 @@
-.\run_cpp.bat ".\offline_10" ".\offline10_quality\rgb_registered.ply"
+.\run_cpp.bat ".\offline_1" ".\offline1_2\rgb_registered.ply"

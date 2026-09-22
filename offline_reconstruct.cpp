@@ -37,6 +37,7 @@
 // upstream implementation with local no-ROS shims. BTC is the default for
 // repeated industrial geometry; --no-btc-loop selects Scan Context directly.
 #include "include/btc.h"
+#include "fast_lio_offline.h"
 
 #include <algorithm>
 #include <array>
@@ -134,6 +135,10 @@ struct Options {
     // persistent adaptive voxel-plane map with an IMU-seeded iterated
     // point-to-plane update.  --gicp remains available for A/B diagnostics.
     bool usePointToPlane = true;
+    // The production path is the tightly coupled LiDAR-inertial front end.
+    // The previous registration pipeline remains available only for A/B
+    // diagnosis with --frontend legacy.
+    std::string frontend{"fast-lio"};
     bool poseGraph = true;
     bool finalPoseRefinement = true;
     double refinementMaxTranslation = 0.10;
@@ -228,6 +233,15 @@ struct AcceptedScan {
     // is inconsistent with the map.  Final fusion must reproduce that same
     // point convention instead of silently deskewing it again.
     bool usedRawFallback{};
+    // Exact scan-local translation correction used by processedPoints()
+    // during front-end registration. Final refinement and fusion must reuse
+    // this value; deriving another correction from pose-graph poses changes
+    // the shape of the scan after it has already been registered.
+    Vec3f translationDeskewLocal{Vec3f::Zero()};
+    // Compact continuous-time IMU trajectory used by the FAST-LIO front end.
+    // Final fusion reuses these exact knots so it cannot silently apply a
+    // different deskew model from the one used for registration.
+    std::vector<offline_lio::MotionKnot> lioMotion;
 };
 
 struct TrajectoryRow {
@@ -1865,6 +1879,12 @@ struct RegistrationResult {
     Mat4f transform{Mat4f::Identity()};
     double fitness{};
     double rmse{};
+    // Point-to-plane residuals can look excellent in a corridor while
+    // translation along the corridor is unobservable. Keep that geometric
+    // information separate from fitness/RMSE so the caller can switch to a
+    // distribution-aware fallback instead of accepting a sliding solution.
+    bool degenerate{};
+    double translationEigenRatio{1.0};
 };
 
 RegistrationResult registerAdaptiveVoxelPlanes(const CloudPtr& source,
@@ -1877,10 +1897,12 @@ RegistrationResult registerAdaptiveVoxelPlanes(const CloudPtr& source,
 
     Mat4d transform = prediction.cast<double>();
     const Mat4d prior = transform;
+    Eigen::Matrix3d finalTranslationInformation = Eigen::Matrix3d::Zero();
     constexpr int kIterations = 8;
     for (int iteration = 0; iteration < kIterations; ++iteration) {
         Eigen::Matrix<double, 6, 6> hessian = Eigen::Matrix<double, 6, 6>::Zero();
         Eigen::Matrix<double, 6, 1> gradient = Eigen::Matrix<double, 6, 1>::Zero();
+        Eigen::Matrix3d translationInformation = Eigen::Matrix3d::Zero();
         std::size_t inliers = 0;
         for (const auto& item : *source) {
             const Vec3d body(item.x, item.y, item.z);
@@ -1900,9 +1922,12 @@ RegistrationResult registerAdaptiveVoxelPlanes(const CloudPtr& source,
             const double information = robust / (0.001 + plane.variance);
             hessian.noalias() += information * jacobian.transpose() * jacobian;
             gradient.noalias() += information * jacobian.transpose() * residual;
+            translationInformation.noalias() +=
+                information * plane.normal * plane.normal.transpose();
             ++inliers;
         }
         if (inliers < std::max<std::size_t>(60, source->size() / 12)) break;
+        finalTranslationInformation = translationInformation;
 
         // FAST-LIVO2 obtains this regularisation from the propagated state
         // covariance.  The offline baseline currently has a validated gyro
@@ -1951,6 +1976,20 @@ RegistrationResult registerAdaptiveVoxelPlanes(const CloudPtr& source,
                      static_cast<double>(std::max<std::size_t>(1, source->size()));
     result.rmse = inliers ? std::sqrt(squaredError / static_cast<double>(inliers))
                           : std::numeric_limits<double>::infinity();
+    if (finalTranslationInformation.allFinite() &&
+        finalTranslationInformation.trace() > 1e-9) {
+        const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(
+            finalTranslationInformation, Eigen::EigenvaluesOnly);
+        if (solver.info() == Eigen::Success) {
+            const auto eigenvalues = solver.eigenvalues();
+            const double largest = std::max(eigenvalues.z(), 1e-12);
+            result.translationEigenRatio = std::max(0.0, eigenvalues.x()) / largest;
+            // Long parallel walls constrain cross-corridor motion but provide
+            // almost no evidence along the corridor. Do not mistake their
+            // many low-residual points for a fully observable 3-D pose.
+            result.degenerate = result.translationEigenRatio < 1e-3;
+        }
+    }
     return result;
 }
 
@@ -2590,13 +2629,16 @@ bool rawPointInRange(const LidarPoint& point, const Options& options, Vec3f& loc
 }
 
 std::vector<WeightedPoint> motionCompensatedGeometry(const std::vector<LidarPoint>& raw,
-                                                      const Mat4f& startPose, const Mat4f& endPose,
+                                                      const Mat4f& startPose,
                                                       std::uint64_t scanDurationNs, const ScanMeta& scan,
                                                       const ImuPreintegrator& preintegrator,
                                                       const Calibration& calibration, const Options& options,
                                                       int& projected, std::vector<WeightedPoint>* rgbOnly,
                                                       std::vector<WeightedPoint>* lidarOnly,
-                                                      bool useDeskew) {
+                                                      bool useDeskew,
+                                                      const Vec3f& translationDeskewLocal,
+                                                      const std::vector<offline_lio::MotionKnot>* lioMotion = nullptr,
+                                                      const offline_lio::Config* lioConfig = nullptr) {
     projected = 0;
     QImage image;
     constexpr std::int64_t kMaxColorPairingNs = 300000000LL;
@@ -2611,8 +2653,21 @@ std::vector<WeightedPoint> motionCompensatedGeometry(const std::vector<LidarPoin
     const auto localAndWorld = [&](const LidarPoint& point, double alpha,
                                    Vec3f& local, Vec3f& world) {
         if (useDeskew) {
-            return deskewedWorldPoint(point, scan.timebase, preintegrator, calibration,
-                                      startPose, endPose, alpha, local, world);
+            if (lioMotion && !lioMotion->empty() && lioConfig) {
+                const offline_lio::LidarPoint lioPoint{
+                    Vec3d(point.x, point.y, point.z), point.offsetNs};
+                local = offline_lio::FastLioOffline::deskewPoint(lioPoint, *lioMotion,
+                                                                  *lioConfig);
+            } else {
+                local = deskewPoint(point, scan.timebase, preintegrator, calibration);
+            }
+            if (!local.allFinite()) return false;
+            if ((!lioMotion || lioMotion->empty()) && translationDeskewLocal.allFinite()) {
+                local += static_cast<float>(std::clamp(alpha, 0.0, 1.0)) *
+                         translationDeskewLocal;
+            }
+            world = (startPose * Eigen::Vector4f(local.x(), local.y(), local.z(), 1.0f)).head<3>();
+            return world.allFinite();
         }
         local = Vec3f(point.x, point.y, point.z);
         if (!local.allFinite()) return false;
@@ -2629,7 +2684,8 @@ std::vector<WeightedPoint> motionCompensatedGeometry(const std::vector<LidarPoin
         ImageProjection projection;
         Vec3f local;
         Vec3f unusedWorld;
-        if (!localAndWorld(point, 0.0, local, unusedWorld)) continue;
+        const double alpha = std::clamp(static_cast<double>(point.offsetNs) / duration, 0.0, 1.0);
+        if (!localAndWorld(point, alpha, local, unusedWorld)) continue;
         if (!projectToImage(image, local, calibration, projection)) continue;
         const int x = std::clamp(static_cast<int>(std::lround(projection.u)), 0, imageWidth - 1);
         const int y = std::clamp(static_cast<int>(std::lround(projection.v)), 0, imageHeight - 1);
@@ -3767,8 +3823,14 @@ void optimizeSe3PoseGraphEigen(std::vector<Mat4f>& poses, const std::vector<Pose
             const Mat4f baseB = poses[static_cast<std::size_t>(edge.b)];
             const Vec6d residual = poseGraphResidual(baseA, baseB, edge.measurement);
             const double norm = residual.norm();
-            const double huber = norm <= 0.30 ? 1.0 : 0.30 / std::max(norm, 1e-9);
-            const double weight = (edge.loop ? 8.0 : 1.0) * huber;
+            // Consecutive odometry edges define the locally verified shape of
+            // the trajectory and must stay quadratic.  Robustify only loop
+            // closures; down-weighting odometry while making every loop eight
+            // times stronger lets one false place match tear the whole map.
+            const double huber = edge.loop && norm > 0.30
+                                     ? 0.30 / std::max(norm, 1e-9)
+                                     : 1.0;
+            const double weight = (edge.loop ? 2.0 : 1.0) * huber;
             cost += weight * residual.squaredNorm();
             Eigen::Matrix<double, 6, 6> jacA = Eigen::Matrix<double, 6, 6>::Zero();
             Eigen::Matrix<double, 6, 6> jacB = Eigen::Matrix<double, 6, 6>::Zero();
@@ -3898,12 +3960,13 @@ void optimizeSe3PoseGraphCeres(std::vector<Mat4f>& poses,
                                            measuredQuaternion.y(), measuredQuaternion.z()};
         functor->measurementTranslation = {measuredTranslation.x(), measuredTranslation.y(),
                                            measuredTranslation.z()};
-        functor->sqrtWeight = std::sqrt(edge.loop ? 8.0 : 1.0);
+        functor->sqrtWeight = std::sqrt(edge.loop ? 2.0 : 1.0);
         auto* cost = new ceres::AutoDiffCostFunction<CeresSe3EdgeCost, 6, 4, 3, 4, 3>(functor);
-        // Huber loss limits a geometrically bad loop edge without discarding
-        // it completely.  Consecutive odometry edges remain quadratic near
-        // the solution, while false loop candidates cannot tear the map.
-        problem.AddResidualBlock(cost, new ceres::HuberLoss(0.30),
+        // Keep sequential LiDAR odometry fully quadratic. Only uncertain loop
+        // closures receive a robust loss, matching the usual pose-graph
+        // treatment of trusted odometry and potentially false place matches.
+        ceres::LossFunction* loss = edge.loop ? new ceres::HuberLoss(0.30) : nullptr;
+        problem.AddResidualBlock(cost, loss,
                                  quaternions[static_cast<std::size_t>(edge.a)].data(),
                                  translations[static_cast<std::size_t>(edge.a)].data(),
                                  quaternions[static_cast<std::size_t>(edge.b)].data(),
@@ -3911,7 +3974,7 @@ void optimizeSe3PoseGraphCeres(std::vector<Mat4f>& poses,
     }
 
     ceres::Solver::Options solverOptions;
-    solverOptions.max_num_iterations = 35;
+    solverOptions.max_num_iterations = 80;
     solverOptions.max_num_consecutive_invalid_steps = 3;
     solverOptions.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     solverOptions.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
@@ -3923,8 +3986,15 @@ void optimizeSe3PoseGraphCeres(std::vector<Mat4f>& poses,
     solverOptions.parameter_tolerance = 1e-7;
     ceres::Solver::Summary summary;
     ceres::Solve(solverOptions, &problem, &summary);
-    if (!summary.IsSolutionUsable()) {
+    if (!summary.IsSolutionUsable() || !std::isfinite(summary.final_cost) ||
+        summary.final_cost > summary.initial_cost) {
         throw std::runtime_error("Ceres pose graph solve failed: " + summary.BriefReport());
+    }
+    if (summary.termination_type == ceres::NO_CONVERGENCE) {
+        // Reaching the iteration limit is not by itself a reason to discard a
+        // useful global correction. The caller performs an independent local
+        // odometry/continuity audit before any optimized pose reaches fusion.
+        std::cout << "warning: Ceres reached its iteration limit; validating the partial solution\n";
     }
     std::cout << "pose graph Ceres SE3 " << summary.BriefReport()
               << " initial_cost=" << summary.initial_cost
@@ -3944,7 +4014,58 @@ void optimizeSe3PoseGraphCeres(std::vector<Mat4f>& poses,
 }
 #endif
 
-void optimizeSe3PoseGraph(std::vector<Mat4f>& poses, const std::vector<PoseGraphEdge>& edges) {
+bool poseGraphSolutionSane(const std::vector<Mat4f>& original,
+                           const std::vector<Mat4f>& optimized,
+                           std::string& reason) {
+    if (original.size() != optimized.size() || original.empty()) {
+        reason = "pose count changed";
+        return false;
+    }
+    Mat4f previousCorrection = optimized.front() * original.front().inverse();
+    for (std::size_t i = 0; i < optimized.size(); ++i) {
+        if (!optimized[i].allFinite()) {
+            reason = "non-finite optimized pose";
+            return false;
+        }
+        const Mat4f correction = optimized[i] * original[i].inverse();
+        if (i == 0) {
+            previousCorrection = correction;
+            continue;
+        }
+        const Mat4f correctionJump = correction * previousCorrection.inverse();
+        const double jumpTranslation = correctionJump.block<3, 1>(0, 3).norm();
+        const double jumpRotation = rotationAngleDeg(correctionJump, Mat4f::Identity());
+        // Global drift correction may be metres over a long route, but it
+        // must vary smoothly between adjacent keyframes. A discontinuity here
+        // produces exactly the branches and duplicated rooms seen in fusion.
+        if (!std::isfinite(jumpTranslation) || !std::isfinite(jumpRotation) ||
+            jumpTranslation > 0.30 || jumpRotation > 6.0) {
+            std::ostringstream out;
+            out << "correction discontinuity at keyframe " << i << " ("
+                << jumpTranslation << " m, " << jumpRotation << " deg)";
+            reason = out.str();
+            return false;
+        }
+        const Mat4f originalRelative = original[i].inverse() * original[i - 1];
+        const Mat4f optimizedRelative = optimized[i].inverse() * optimized[i - 1];
+        const Mat4f localChange = originalRelative.inverse() * optimizedRelative;
+        const double localTranslation = localChange.block<3, 1>(0, 3).norm();
+        const double localRotation = rotationAngleDeg(localChange, Mat4f::Identity());
+        if (!std::isfinite(localTranslation) || !std::isfinite(localRotation) ||
+            localTranslation > 0.20 || localRotation > 4.0) {
+            std::ostringstream out;
+            out << "local odometry deformation at keyframe " << i << " ("
+                << localTranslation << " m, " << localRotation << " deg)";
+            reason = out.str();
+            return false;
+        }
+        previousCorrection = correction;
+    }
+    return true;
+}
+
+bool optimizeSe3PoseGraph(std::vector<Mat4f>& poses, const std::vector<PoseGraphEdge>& edges) {
+    const std::vector<Mat4f> original = poses;
 #if defined(OFFLINE_HAVE_CERES)
     try {
         optimizeSe3PoseGraphCeres(poses, edges);
@@ -3954,11 +4075,34 @@ void optimizeSe3PoseGraph(std::vector<Mat4f>& poses, const std::vector<PoseGraph
         // safety net and make the fallback explicit in the log.
         std::cerr << "Ceres pose graph failed (" << error.what()
                   << "); falling back to Eigen SE3 GN\n";
-        optimizeSe3PoseGraphEigen(poses, edges);
+        poses = original;
+        try {
+            optimizeSe3PoseGraphEigen(poses, edges);
+        } catch (const std::exception& fallbackError) {
+            std::cerr << "Eigen pose graph failed (" << fallbackError.what()
+                      << "); keeping front-end trajectory\n";
+            poses = original;
+            return false;
+        }
     }
 #else
-    optimizeSe3PoseGraphEigen(poses, edges);
+    try {
+        optimizeSe3PoseGraphEigen(poses, edges);
+    } catch (const std::exception& error) {
+        std::cerr << "Eigen pose graph failed (" << error.what()
+                  << "); keeping front-end trajectory\n";
+        poses = original;
+        return false;
+    }
 #endif
+    std::string reason;
+    if (!poseGraphSolutionSane(original, poses, reason)) {
+        std::cerr << "pose graph result rejected: " << reason
+                  << "; keeping front-end trajectory\n";
+        poses = original;
+        return false;
+    }
+    return true;
 }
 
 using BtcCloud = pcl::PointCloud<pcl::PointXYZI>;
@@ -4006,7 +4150,10 @@ ConfigSetting makeBtcConfig(const Options& options) {
     config.descriptor_max_len_ = 30.0f;
     config.non_max_suppression_radius_ = 1.0f;
     config.std_side_resolution_ = 0.2f;
-    config.skip_near_num_ = std::max(5, options.btcMinSeparation);
+    // A candidate only a few seconds after the current keyframe is usually
+    // ordinary local overlap, not a revisit.  Do not let BTC turn adjacent
+    // frames in a repeated corridor into high-weight global edges.
+    config.skip_near_num_ = std::max(60, options.btcMinSeparation);
     config.candidate_num_ = std::max(1, options.btcMaxCandidates);
     config.rough_dis_threshold_ = 0.01f;
     config.similarity_threshold_ = static_cast<float>(std::clamp(options.btcSimilarityThreshold, 0.4, 0.95));
@@ -4047,8 +4194,21 @@ std::pair<std::vector<Mat4f>, int> optimizePoseGraphBtc(
 
     int queries = 0;
     int candidates = 0;
+    int geometricallyValidated = 0;
     int validated = 0;
     int rejected = 0;
+    const int effectiveLoopSeparation = std::max({60, options.btcMinSeparation,
+                                                   options.loopMinSeparation});
+    struct BtcLoopProposal {
+        int source{};
+        int target{};
+        RegistrationResult registration;
+        double similarity{};
+        std::size_t matchCount{};
+        Mat4f worldCorrection{Mat4f::Identity()};
+    };
+    std::vector<BtcLoopProposal> proposals;
+    proposals.reserve(keyClouds.size() / 20 + 1);
     for (std::size_t current = 0; current < keyClouds.size(); ++current) {
         const auto btcCloud = btcInputCloud(keyClouds[current]);
         std::vector<BTC> descriptors;
@@ -4065,7 +4225,7 @@ std::pair<std::vector<Mat4f>, int> optimizePoseGraphBtc(
             std::cout << "BTC frame " << current << " generation failed: " << error.what() << '\n';
             continue;
         }
-        if (current >= static_cast<std::size_t>(std::max(1, options.btcMinSeparation)) && !descriptors.empty()) {
+        if (current >= static_cast<std::size_t>(effectiveLoopSeparation) && !descriptors.empty()) {
             ++queries;
             std::pair<int, double> loopResult{-1, 0.0};
             std::pair<Eigen::Vector3d, Eigen::Matrix3d> btcTransform{Eigen::Vector3d::Zero(),
@@ -4094,9 +4254,13 @@ std::pair<std::vector<Mat4f>, int> optimizePoseGraphBtc(
                     keyClouds[static_cast<std::size_t>(source)], keyClouds[current],
                     options.icpVoxel, btcEdge, options, validation, validationReason);
                 if (valid) {
-                    edges.push_back({source, static_cast<int>(current), validation.transform, true});
-                    ++validated;
-                    std::cout << "BTC loop " << source << "->" << current
+                    const Mat4f expectedTargetPose =
+                        keyPoses[static_cast<std::size_t>(source)] * validation.transform.inverse();
+                    const Mat4f correction = expectedTargetPose * keyPoses[current].inverse();
+                    proposals.push_back({source, static_cast<int>(current), validation,
+                                         loopResult.second, matches.size(), correction});
+                    ++geometricallyValidated;
+                    std::cout << "BTC geometrically valid candidate " << source << "->" << current
                               << " similarity=" << loopResult.second
                               << " matches=" << matches.size()
                               << " fitness=" << validation.fitness
@@ -4117,13 +4281,59 @@ std::pair<std::vector<Mat4f>, int> optimizePoseGraphBtc(
                       << " descriptors=" << descriptors.size() << '\n';
         }
     }
+    // A repeated wall can pass bidirectional ICP once by chance. A real
+    // revisit normally persists for several neighbouring keyframes and gives
+    // them nearly the same world-frame correction. Require that temporal
+    // evidence, except for an exceptionally strong descriptor+geometry match.
+    std::vector<int> acceptedLoopTargets;
+    acceptedLoopTargets.reserve(proposals.size());
+    for (std::size_t i = 0; i < proposals.size(); ++i) {
+        const auto& proposal = proposals[i];
+        bool supported = proposal.registration.fitness >= 0.90 &&
+                         proposal.registration.rmse <= 0.05 &&
+                         proposal.matchCount >= 6;
+        for (std::size_t j = 0; j < proposals.size() && !supported; ++j) {
+            if (i == j) continue;
+            const auto& neighbour = proposals[j];
+            const int targetGap = std::abs(proposal.target - neighbour.target);
+            const int sourceGap = std::abs(proposal.source - neighbour.source);
+            if (targetGap == 0 || targetGap > 12 || sourceGap > 12) continue;
+            const Mat4f correctionDifference =
+                proposal.worldCorrection * neighbour.worldCorrection.inverse();
+            const double translationDifference =
+                correctionDifference.block<3, 1>(0, 3).norm();
+            const double rotationDifference =
+                rotationAngleDeg(correctionDifference, Mat4f::Identity());
+            supported = std::isfinite(translationDifference) &&
+                        std::isfinite(rotationDifference) &&
+                        translationDifference <= 1.0 && rotationDifference <= 12.0;
+        }
+        if (!supported) {
+            ++rejected;
+            std::cout << "BTC candidate " << proposal.source << "->" << proposal.target
+                      << " rejected: no temporally consistent neighbour\n";
+            continue;
+        }
+        const bool redundant = std::any_of(
+            acceptedLoopTargets.begin(), acceptedLoopTargets.end(),
+            [&](int target) { return std::abs(target - proposal.target) < 5; });
+        if (redundant) continue;
+        edges.push_back({proposal.source, proposal.target,
+                         proposal.registration.transform, true});
+        acceptedLoopTargets.push_back(proposal.target);
+        ++validated;
+        std::cout << "BTC loop committed " << proposal.source << "->" << proposal.target
+                  << " fitness=" << proposal.registration.fitness
+                  << " rmse=" << proposal.registration.rmse << '\n';
+    }
     std::cout << "BTC summary: queries=" << queries
               << " candidates=" << candidates
+              << " geometric=" << geometricallyValidated
               << " validated=" << validated
               << " rejected=" << rejected << '\n';
     if (validated == 0) return {result, 0};
 
-    optimizeSe3PoseGraph(keyPoses, edges);
+    if (!optimizeSe3PoseGraph(keyPoses, edges)) return {result, 0};
     std::vector<Mat4f> corrections;
     corrections.reserve(keyPoses.size());
     for (std::size_t i = 0; i < keyPoses.size(); ++i) {
@@ -4152,9 +4362,11 @@ std::pair<std::vector<Mat4f>, int> optimizePoseGraph(const std::vector<AcceptedS
                                                        const std::vector<int>& keyAcceptedIds,
                                                        const Options& options) {
     if (options.btcLoop) {
-        auto btcResult = optimizePoseGraphBtc(accepted, keyClouds, keyAcceptedIds, options);
-        if (btcResult.second > 0) return btcResult;
-        std::cout << "BTC validated no loop closure; falling back to Scan Context retrieval\n";
+        // Do not silently switch place-recognition models after BTC rejected
+        // all candidates. That bypassed BTC's temporal-consistency checks and
+        // allowed an isolated Scan Context match to deform the map. Scan
+        // Context remains explicitly available through --no-btc-loop.
+        return optimizePoseGraphBtc(accepted, keyClouds, keyAcceptedIds, options);
     }
     std::vector<Mat4f> result;
     result.reserve(accepted.size());
@@ -4171,11 +4383,14 @@ std::pair<std::vector<Mat4f>, int> optimizePoseGraph(const std::vector<AcceptedS
         edges.push_back({static_cast<int>(i - 1), static_cast<int>(i), keyPoses[i].inverse() * keyPoses[i - 1], false});
     }
     int loops = 0;
+    const int effectiveLoopSeparation = std::max(60, options.loopMinSeparation);
+    std::vector<int> acceptedLoopTargets;
+    acceptedLoopTargets.reserve(keyPoses.size() / 10 + 1);
     for (std::size_t target = 0; target < keyPoses.size(); ++target) {
-        if (target < static_cast<std::size_t>(options.loopMinSeparation)) continue;
+        if (target < static_cast<std::size_t>(effectiveLoopSeparation)) continue;
         struct Candidate { double ringScore; double score; int source; };
         std::vector<Candidate> candidates;
-        for (std::size_t source = 0; source + options.loopMinSeparation <= target; ++source) {
+            for (std::size_t source = 0; source + static_cast<std::size_t>(effectiveLoopSeparation) <= target; ++source) {
             const double distance = (keyPoses[source].block<3, 1>(0, 3) - keyPoses[target].block<3, 1>(0, 3)).norm();
             const double ringDistance = (Eigen::Map<const Eigen::VectorXf>(signatures[source].ringKey.data(),
                                                                             kScanContextRings) -
@@ -4228,14 +4443,21 @@ std::pair<std::vector<Mat4f>, int> optimizePoseGraph(const std::vector<AcceptedS
             }
         }
         if (acceptedLoopForTarget && bestLoopSource >= 0) {
+            const bool clusteredWithPreviousTarget = std::any_of(
+                acceptedLoopTargets.begin(), acceptedLoopTargets.end(),
+                [&](int previousTarget) {
+                    return std::abs(previousTarget - static_cast<int>(target)) < 30;
+                });
+            if (clusteredWithPreviousTarget) continue;
             edges.push_back({bestLoopSource, static_cast<int>(target), bestLoopRegistration.transform, true});
+            acceptedLoopTargets.push_back(static_cast<int>(target));
             ++loops;
             std::cout << "loop " << bestLoopSource << "->" << target << " fitness=" << bestLoopFitness
                       << " rmse=" << bestLoopRmse << '\n';
         }
     }
     if (loops == 0) return {result, 0};
-    optimizeSe3PoseGraph(keyPoses, edges);
+    if (!optimizeSe3PoseGraph(keyPoses, edges)) return {result, 0};
     std::vector<Mat4f> corrections;
     corrections.reserve(keyPoses.size());
     for (std::size_t i = 0; i < keyPoses.size(); ++i) corrections.push_back(keyPoses[i] * accepted[static_cast<std::size_t>(keyAcceptedIds[i])].initialPose.inverse());
@@ -4308,6 +4530,7 @@ Options parseOptions(int argc, char** argv) {
         else if (arg == "--no-eskf-prediction") options.useEskfPrediction = false;
         else if (arg == "--point-to-plane") options.usePointToPlane = true;
         else if (arg == "--gicp") options.usePointToPlane = false;
+        else if (arg == "--frontend") options.frontend = lower(next());
         else if (arg == "--max-imu-rotation-correction") options.maxImuRotationCorrectionDeg = std::stod(next());
         else if (arg == "--startup-static-lock") options.startupStaticLock = true;
         else if (arg == "--no-startup-static-lock") options.startupStaticLock = false;
@@ -4341,7 +4564,8 @@ Options parseOptions(int argc, char** argv) {
                       << "  --max-denoise-points N --denoise-tile-size M --denoise-halo M --denoise-mean-k N\n"
                       << "  --max-isolation-points N --local-map-frames N\n"
                       << "  --lidar-color-near M --lidar-color-far M --no-pose-graph\n"
-                      << "  --point-to-plane (default adaptive voxel-plane front end) --gicp --eskf-prediction\n"
+                      << "  --frontend fast-lio|legacy (default fast-lio)\n"
+                      << "  --point-to-plane --gicp --eskf-prediction (legacy front end only)\n"
                       << "  --max-imu-rotation-correction DEG --no-startup-static-lock\n"
                       << "  --keyframe-stride N --max-pose-graph-keyframes N\n"
                       << "  --final-refinement (default) --no-final-refinement\n"
@@ -4383,6 +4607,9 @@ Options parseOptions(int argc, char** argv) {
         options.btcIcpThreshold <= 0.0 || options.btcIcpThreshold >= 1.0 ||
         options.btcVoxelSize <= 0.0) {
         throw std::runtime_error("BTC parameters are invalid");
+    }
+    if (options.frontend != "fast-lio" && options.frontend != "legacy") {
+        throw std::runtime_error("--frontend must be fast-lio or legacy");
     }
     return options;
 }
@@ -4513,15 +4740,51 @@ int main(int argc, char** argv) {
         }
         std::cout << "frames=" << dataset.scans().size() << " unique_scans=" << scans.size() << '\n';
         std::cout << "RGB image time offset: " << calibration.imageTimeOffsetSec << " s\n";
-        std::cout << "registration frontend: " << (options.usePointToPlane ? "adaptive voxel-plane" : "GICP")
-                  << ", ESKF prediction: " << (options.useEskfPrediction ? "enabled" : "disabled") << '\n';
-        if (options.usePointToPlane) {
+        const bool useFastLio = options.frontend == "fast-lio";
+        std::cout << "registration frontend: "
+                  << (useFastLio ? "FAST-LIO tightly coupled ESKF"
+                                 : (options.usePointToPlane ? "legacy adaptive voxel-plane" : "legacy GICP"));
+        if (!useFastLio) {
+            std::cout << ", legacy ESKF prediction: "
+                      << (options.useEskfPrediction ? "enabled" : "disabled");
+        }
+        std::cout << '\n';
+        if (useFastLio || options.usePointToPlane) {
             std::cout << "voxel-plane map: voxel=" << calibration.lioVoxelSize
                       << " m, plane eigen threshold=" << calibration.lioPlaneThreshold << '\n';
         }
         std::cout << "loop retrieval: " << (options.btcLoop ? "BTC (upstream hku-mars, local validation)" : "Scan Context") << '\n';
         const ImuPreintegrator preintegrator(dataset.imu(), appliedGyroBias);
         LioEskf eskf(dataset.imu(), appliedGyroBias, calibration);
+        std::unique_ptr<offline_lio::FastLioOffline> fastLio;
+        offline_lio::Config fastLioConfig;
+        if (useFastLio) {
+            fastLioConfig.lidar_to_imu_rotation = calibration.lidarToImuR;
+            fastLioConfig.lidar_to_imu_translation = calibration.lidarToImuT;
+            fastLioConfig.initial_gyro_bias = appliedGyroBias;
+            fastLioConfig.accel_scale = calibration.imuInitialization.valid
+                                            ? calibration.imuInitialization.accelScale
+                                            : (dataset.imu().front().accel.norm() < 3.0
+                                                   ? 9.80665 / std::max(1e-6, dataset.imu().front().accel.norm())
+                                                   : 1.0);
+            fastLioConfig.initial_accel_mean = calibration.imuInitialization.valid
+                                                   ? calibration.imuInitialization.accelMean
+                                                   : fastLioConfig.accel_scale * dataset.imu().front().accel;
+            fastLioConfig.voxel_size = calibration.lioVoxelSize;
+            fastLioConfig.plane_threshold = calibration.lioPlaneThreshold;
+            // Match the MID360 surface filter used by the real-time mapper.
+            // Final output remains dense; this voxel affects state estimation only.
+            fastLioConfig.registration_voxel = std::max(0.15, static_cast<double>(options.icpVoxel));
+            fastLioConfig.blind = options.blind;
+            fastLioConfig.max_range = options.maxRange;
+            std::vector<offline_lio::ImuSample> lioImu;
+            lioImu.reserve(dataset.imu().size());
+            for (const auto& sample : dataset.imu()) {
+                lioImu.push_back({sample.stamp, sample.gyro, sample.accel});
+            }
+            fastLio = std::make_unique<offline_lio::FastLioOffline>(std::move(lioImu),
+                                                                    fastLioConfig);
+        }
         StartupMotionInfo startupMotion;
         if (options.startupStaticLock) {
             startupMotion = detectStartupMotion(dataset.imu(), calibration.imuInitialization);
@@ -4588,6 +4851,92 @@ int main(int argc, char** argv) {
                 // rosbag receive timestamp and is retained only for RGB
                 // pairing and human-readable trajectory output.
                 const std::int64_t scanTime = lidarClockStamp(scan);
+                if (useFastLio) {
+                    std::vector<offline_lio::LidarPoint> lioPoints;
+                    lioPoints.reserve(raw.size());
+                    for (const auto& point : raw) {
+                        lioPoints.push_back({Vec3d(point.x, point.y, point.z), point.offsetNs});
+                    }
+                    const std::size_t nextScanIndex = static_cast<std::size_t>(scan.index + 1);
+                    const std::int64_t nextScanTime = nextScanIndex < scans.size()
+                                                          ? lidarClockStamp(scans[nextScanIndex])
+                                                          : 0;
+                    auto lioResult = fastLio->process(scanTime, nextScanTime, lioPoints);
+                    if (!lioResult.usable || !lioResult.world_from_lidar.allFinite()) {
+                        ++rejected;
+                        ++consecutiveRejected;
+                        maximumConsecutiveRejected = std::max(maximumConsecutiveRejected,
+                                                               consecutiveRejected);
+                        const Vec3f position = lioResult.world_from_lidar
+                                                   .block<3, 1>(0, 3).cast<float>();
+                        trajectory.push_back({scan.index, scan.stamp, position,
+                                              lioResult.fitness, lioResult.rmse, 0,
+                                              static_cast<int>(lioResult.deskewed_points.size()),
+                                              false, lioResult.reason});
+                        std::cout << "reject scan " << scan.index << ": "
+                                  << lioResult.reason << " | lio_fit=" << lioResult.fitness
+                                  << " lio_rmse=" << lioResult.rmse
+                                  << " effective=" << lioResult.effective_points << '\n';
+                        return;
+                    }
+
+                    worldFromCurrent = lioResult.world_from_lidar.cast<float>();
+                    auto local = cloudFromPoints(lioResult.deskewed_points);
+                    auto worldCloud = std::make_shared<Cloud>();
+                    pcl::transformPointCloud(*local, *worldCloud, worldFromCurrent);
+                    localParts.push_back(worldCloud);
+                    while (localParts.size() > options.localMapFrames) localParts.erase(localParts.begin());
+                    consecutiveRejected = 0;
+                    const int acceptedId = static_cast<int>(accepted.size());
+                    accepted.push_back({scan.index, worldFromCurrent, worldFromCurrent,
+                                        lioResult.fitness, lioResult.rmse, 0,
+                                        static_cast<int>(lioResult.deskewed_points.size()),
+                                        false, Vec3f::Zero(), std::move(lioResult.motion)});
+                    trajectory.push_back({scan.index, scan.stamp,
+                                          worldFromCurrent.block<3, 1>(0, 3),
+                                          lioResult.fitness, lioResult.rmse, 0,
+                                          static_cast<int>(lioResult.deskewed_points.size()),
+                                          true, lioResult.reason});
+                    if (options.preview &&
+                        (acceptedId == 0 || (acceptedId + 1) % options.previewInterval == 0)) {
+                        writePreviewPoseArtifact(options.previewDir, trajectory.back(), "registration");
+                    }
+                    if (options.poseGraph &&
+                        (acceptedId % effectiveKeyframeStride == 0 || acceptedId == 0)) {
+                        keyAcceptedIds.push_back(acceptedId);
+                        const float loopCloudVoxel = std::max(0.06f, options.icpVoxel * 2.0f);
+                        auto submapWorld = std::make_shared<Cloud>();
+                        for (const auto& part : localParts) if (part) *submapWorld += *part;
+                        auto submapLocal = std::make_shared<Cloud>();
+                        pcl::transformPointCloud(*submapWorld, *submapLocal,
+                                                 worldFromCurrent.inverse());
+                        keyClouds.push_back(boundedPreviewCloud(submapLocal, loopCloudVoxel, 12000));
+                    }
+                    if (options.preview) {
+                        *previewAccum += *worldCloud;
+                        if (acceptedId == 0 ||
+                            acceptedId + 1 >= previewLastPublished +
+                                                    static_cast<std::size_t>(options.previewInterval)) {
+                            const auto preview = boundedPreviewCloud(previewAccum, options.previewVoxel,
+                                                                     options.previewMaxPoints, true);
+                            previewAccum = preview;
+                            writePreviewArtifacts(options.previewDir, preview, trajectory,
+                                                  static_cast<std::size_t>(scan.index + 1), scans.size(),
+                                                  "registration", options.lidarColorNear,
+                                                  options.lidarColorFar);
+                            previewLastPublished = static_cast<std::size_t>(acceptedId + 1);
+                        }
+                    }
+                    if (acceptedId == 0 || (acceptedId + 1) % 10 == 0) {
+                        std::cout << "scan " << scan.index
+                                  << " points=" << lioResult.deskewed_points.size()
+                                  << " fitness=" << lioResult.fitness
+                                  << " rmse=" << lioResult.rmse
+                                  << " lio=" << (lioResult.lidar_corrected ? "corrected" : "imu_bridge")
+                                  << '\n';
+                    }
+                    return;
+                }
                 // Keep the registration pass on the same gyro-only deskewed
                 // cloud as the validated baseline.  Translation compensation
                 // requires a jointly estimated continuous-time pose; using a
@@ -4597,6 +4946,7 @@ int main(int argc, char** argv) {
                 auto points = processedPoints(scan, raw, preintegrator, calibration, options);
                 auto local = cloudFromPoints(points);
                 auto current = voxelCloud(local, options.icpVoxel);
+                Vec3f scanTranslationDeskewLocal = Vec3f::Zero();
                 const Mat4f poseBeforeRegistration = worldFromCurrent;
                 const std::int64_t stampBeforeRegistration = lastAcceptedStamp;
                 RegistrationResult registration{worldFromCurrent, 1.0, 0.0};
@@ -4658,19 +5008,16 @@ int main(int argc, char** argv) {
                             scanTime, preintegrator, calibration);
                     }
 
+                    // Never reshape a sweep from an unverified translation
+                    // prediction. Constant-velocity and free-running IMU
+                    // translation are both wrong for a short interval when
+                    // the operator turns around; applying either prediction
+                    // to every point can move the scan out of the correct ICP
+                    // basin before any LiDAR observation is evaluated. The
+                    // first registration therefore stays gyro-only. Once a
+                    // LiDAR pose is measured below, that measured delta is
+                    // used for one bounded translation-deskew refinement.
                     Vec3f translationDeskewLocal = Vec3f::Zero();
-                    const Vec3f predictedWorldDelta =
-                        predicted.block<3, 1>(0, 3) - worldFromCurrent.block<3, 1>(0, 3);
-                    if (predictedWorldDelta.allFinite() && predictedWorldDelta.norm() <= 0.50f) {
-                        translationDeskewLocal = predicted.block<3, 3>(0, 0).transpose() *
-                                                 predictedWorldDelta;
-                        if (translationDeskewLocal.norm() > 0.001f) {
-                            points = processedPoints(scan, raw, preintegrator, calibration,
-                                                     options, translationDeskewLocal);
-                            local = cloudFromPoints(points);
-                            current = voxelCloud(local, options.icpVoxel);
-                        }
-                    }
 
                     // Compute a cheap, short-baseline registration for
                     // diagnostics. It is never used as an accepted pose or as
@@ -4752,6 +5099,7 @@ int main(int argc, char** argv) {
                                         local = std::move(refinedLocal);
                                         current = std::move(refinedCurrent);
                                         registration = refined;
+                                        scanTranslationDeskewLocal = measuredLocal;
                                         translationDeskewLocal = measuredLocal;
                                         ++translationDeskewScans;
                                     }
@@ -4764,18 +5112,30 @@ int main(int argc, char** argv) {
                         const bool weakPlane = !std::isfinite(registration.fitness) ||
                                                !std::isfinite(registration.rmse) ||
                                                registration.fitness < options.minIcpFitness ||
-                                               registration.rmse > options.maxIcpRmse;
+                                               registration.rmse > options.maxIcpRmse ||
+                                               registration.degenerate;
                         if (weakPlane) {
                             const auto fallback = registerScan(current, mapCloud, options.icpVoxel, predicted);
                             const bool fallbackBetter = std::isfinite(fallback.fitness) &&
                                                         std::isfinite(fallback.rmse) &&
-                                                        (fallback.fitness > registration.fitness ||
+                                                        ((registration.degenerate &&
+                                                          fallback.fitness >= options.minIcpFitness &&
+                                                          fallback.rmse <= options.maxIcpRmse) ||
+                                                         fallback.fitness > registration.fitness ||
                                                          !std::isfinite(registration.rmse) ||
                                                          fallback.rmse < registration.rmse);
                             if (fallbackBetter) {
-                                std::cout << "voxel-plane weak at scan " << scan.index
+                                std::cout << (registration.degenerate
+                                                  ? "voxel-plane degenerate at scan "
+                                                  : "voxel-plane weak at scan ")
+                                          << scan.index
                                           << "; using GICP fallback fitness=" << fallback.fitness
-                                          << " rmse=" << fallback.rmse << '\n';
+                                          << " rmse=" << fallback.rmse;
+                                if (registration.degenerate) {
+                                    std::cout << " translation_eigen_ratio="
+                                              << registration.translationEigenRatio;
+                                }
+                                std::cout << '\n';
                                 registration = fallback;
                             }
                         }
@@ -4799,8 +5159,7 @@ int main(int argc, char** argv) {
                     // verified pose when the predictive result is weak (or
                     // when it is simply a different valid branch), and keep
                     // the candidate only if it passes the same strict gate.
-                    if (!options.usePointToPlane && !options.useEskfPrediction &&
-                        mapCloud && !registrationValid) {
+                    if (!options.usePointToPlane && !options.useEskfPrediction && mapCloud) {
                         const auto baselineRegistration = registerScan(current, mapCloud,
                                                                         options.icpVoxel, worldFromCurrent);
                         std::string baselineReason;
@@ -4918,6 +5277,7 @@ int main(int argc, char** argv) {
                             local = rawLocal;
                             current = rawCurrent;
                             registration = rawRegistration;
+                            scanTranslationDeskewLocal = Vec3f::Zero();
                             registrationValid = true;
                             reason = "raw_scan_fallback";
                             ++rawFallbackScans;
@@ -5043,7 +5403,7 @@ int main(int argc, char** argv) {
                                              reason == "raw_verified_pose_seed";
                 accepted.push_back({scan.index, worldFromCurrent, worldFromCurrent, registration.fitness,
                                     registration.rmse, 0, static_cast<int>(points.size()),
-                                    usedRawFallback});
+                                    usedRawFallback, scanTranslationDeskewLocal});
                 trajectory.push_back({scan.index, scan.stamp, worldFromCurrent.block<3, 1>(0, 3), registration.fitness,
                                       registration.rmse, 0, static_cast<int>(points.size()), true, reason});
                 if (options.preview &&
@@ -5147,7 +5507,7 @@ int main(int argc, char** argv) {
         }
         std::size_t finalRefinedScans = 0;
         std::size_t finalRefinementRejected = 0;
-        if (options.finalPoseRefinement) {
+        if (options.finalPoseRefinement && !useFastLio) {
             std::cout << "final surface refinement: rebuilding voxel-plane map from optimized trajectory\n";
             AdaptiveVoxelPlaneMap refinementMap(calibration.lioVoxelSize,
                                                  calibration.lioPlaneThreshold);
@@ -5159,29 +5519,9 @@ int main(int argc, char** argv) {
                     Mat4f pose = accepted[id].optimizedPose;
                     const bool startupPoseLocked = startupMotion.enabled &&
                         (!startupMotion.detected || lidarClockStamp(scan) < startupMotion.stamp);
-                    Vec3f sweepTranslationLocal = Vec3f::Zero();
-                    if (id + 1 < accepted.size()) {
-                        const auto& nextMeta = scans[static_cast<std::size_t>(accepted[id + 1].scanIndex)];
-                        const std::uint64_t currentTime = scan.timebase;
-                        const std::uint64_t nextTime = nextMeta.timebase;
-                        std::uint32_t sweepNs = 0;
-                        for (const auto& point : raw) sweepNs = std::max(sweepNs, point.offsetNs);
-                        if (nextTime > currentTime && sweepNs > 0) {
-                            const double fraction = std::clamp(
-                                static_cast<double>(sweepNs) /
-                                    static_cast<double>(nextTime - currentTime),
-                                0.0, 1.0);
-                            const Vec3f sweepWorld = static_cast<float>(fraction) *
-                                (accepted[id + 1].optimizedPose.block<3, 1>(0, 3) -
-                                 pose.block<3, 1>(0, 3));
-                            if (sweepWorld.allFinite() && sweepWorld.norm() <= 0.50f) {
-                                sweepTranslationLocal = pose.block<3, 3>(0, 0).transpose() *
-                                                        sweepWorld;
-                            }
-                        }
-                    }
                     auto pointValues = processedPoints(scan, raw, preintegrator, calibration,
-                                                       options, sweepTranslationLocal);
+                                                       options,
+                                                       accepted[id].translationDeskewLocal);
                     auto localCloud = cloudFromPoints(pointValues);
                     auto registrationCloud = voxelCloud(localCloud, options.icpVoxel);
                     if (!startupPoseLocked && refinementMap.size() >= 20) {
@@ -5218,13 +5558,24 @@ int main(int argc, char** argv) {
             std::cout << "final surface refinement: corrected " << finalRefinedScans
                       << " scans, kept pose-graph pose for " << finalRefinementRejected
                       << " scans\n";
+        } else if (options.finalPoseRefinement && useFastLio) {
+            std::cout << "final surface refinement: skipped for FAST-LIO; "
+                         "the tightly coupled trajectory is kept internally consistent\n";
         }
         if (options.preview) {
-            const auto preview = boundedPreviewCloud(previewAccum, options.previewVoxel,
-                                                     options.previewMaxPoints, true);
-            previewAccum = preview;
-            writePreviewArtifacts(options.previewDir, preview, trajectory, accepted.size(), scans.size(),
-                                  "fusion", options.lidarColorNear, options.lidarColorFar);
+            // Registration snapshots and trajectory rows use pre-graph poses.
+            // Switch the whole trajectory atomically before fusion rather
+            // than mixing an optimized prefix with an unoptimized suffix.
+            for (auto& row : trajectory) {
+                const auto found = acceptedByScan.find(row.index);
+                if (found != acceptedByScan.end()) {
+                    row.position = accepted[found->second].optimizedPose.block<3, 1>(0, 3);
+                }
+            }
+            previewAccum->clear();
+            writePreviewArtifacts(options.previewDir, previewAccum, trajectory,
+                                  0, accepted.size(), "fusion",
+                                  options.lidarColorNear, options.lidarColorFar);
         }
 
         DiskVoxelFusion lidarFusion(scratch, "lidar_depth", options.lidarMapVoxel,
@@ -5244,7 +5595,6 @@ int main(int argc, char** argv) {
                 if (found == acceptedByScan.end()) return;
                 const std::size_t acceptedId = found->second;
                 const Mat4f startPose = accepted[acceptedId].optimizedPose;
-                Mat4f endPose = startPose;
                 std::uint64_t scanDurationNs = 0;
                 for (const auto& point : raw) {
                     scanDurationNs = std::max(scanDurationNs,
@@ -5263,33 +5613,16 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                if (acceptedId + 1 < accepted.size()) {
-                    const auto& nextScan = scans[static_cast<std::size_t>(accepted[acceptedId + 1].scanIndex)];
-                    if (nextScan.timebase > scan.timebase) {
-                        const std::uint64_t acceptedGap = nextScan.timebase - scan.timebase;
-                        // Estimate the pose at this sweep's end from the next
-                        // accepted pose. Across a long rejected-frame gap the
-                        // velocity is not observable, so disabling translation
-                        // interpolation is safer than smearing the sweep with
-                        // a recovery jump.
-                        if (acceptedGap <= 500000000ULL) {
-                            const double fraction = std::clamp(
-                                static_cast<double>(scanDurationNs) /
-                                    static_cast<double>(acceptedGap),
-                                0.0, 1.0);
-                            endPose = interpolatePose(startPose,
-                                                      accepted[acceptedId + 1].optimizedPose,
-                                                      fraction);
-                        }
-                    }
-                }
                 std::vector<WeightedPoint> rgbOnly;
                 std::vector<WeightedPoint> lidarOnly;
                 int projected = 0;
-                auto geometry = motionCompensatedGeometry(raw, startPose, endPose, scanDurationNs,
+                auto geometry = motionCompensatedGeometry(raw, startPose, scanDurationNs,
                                                            scan, preintegrator, calibration, options,
                                                            projected, &rgbOnly, &lidarOnly,
-                                                           !accepted[acceptedId].usedRawFallback);
+                                                           !accepted[acceptedId].usedRawFallback,
+                                                           accepted[acceptedId].translationDeskewLocal,
+                                                           useFastLio ? &accepted[acceptedId].lioMotion : nullptr,
+                                                           useFastLio ? &fastLioConfig : nullptr);
                 if (options.preview) {
                     for (const auto& point : geometry) {
                         fusionPreviewAccum->push_back(pcl::PointXYZ(point.x, point.y, point.z));
@@ -5384,7 +5717,7 @@ int main(int argc, char** argv) {
               << "  \"fusion_failures\": " << fusionFailures << ",\n"
               << "  \"pose_graph_loop_edges\": " << loopEdges << ",\n"
               << "  \"final_pose_refinement_enabled\": "
-              << (options.finalPoseRefinement ? "true" : "false") << ",\n"
+              << (options.finalPoseRefinement && !useFastLio ? "true" : "false") << ",\n"
               << "  \"final_pose_refined_scans\": " << finalRefinedScans << ",\n"
               << "  \"final_pose_refinement_rejected\": " << finalRefinementRejected << ",\n"
               << "  \"loop_retrieval\": \"" << (options.btcLoop ? "btc" : "scan_context") << "\",\n"
@@ -5413,8 +5746,12 @@ int main(int argc, char** argv) {
               << "  \"icp_voxel_m\": " << options.icpVoxel << ",\n"
               << "  \"map_voxel_m\": " << options.mapVoxel << ",\n"
               << "  \"lidar_map_voxel_m\": " << options.lidarMapVoxel << ",\n"
-              << "  \"registration_frontend\": \"" << (options.usePointToPlane ? "adaptive_voxel_plane" : "gicp") << "\",\n"
-              << "  \"eskf_prediction_enabled\": " << (options.useEskfPrediction ? "true" : "false") << ",\n"
+              << "  \"registration_frontend\": \""
+              << (useFastLio ? "fast_lio_tightly_coupled"
+                             : (options.usePointToPlane ? "legacy_adaptive_voxel_plane" : "legacy_gicp"))
+              << "\",\n"
+              << "  \"eskf_prediction_enabled\": "
+              << (useFastLio || options.useEskfPrediction ? "true" : "false") << ",\n"
               << "  \"image_time_offset_s\": " << calibration.imageTimeOffsetSec << ",\n"
               << "  \"imu_time_offset_s\": " << calibration.imuTimeOffsetSec << ",\n"
               << "  \"imu_applied_timestamp_correction_s\": "
