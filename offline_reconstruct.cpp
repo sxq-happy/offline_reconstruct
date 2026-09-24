@@ -46,6 +46,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -81,7 +82,11 @@ struct Options {
     fs::path output;
     float icpVoxel = 0.03f;
     float mapVoxel = 0.01f;
-    float lidarMapVoxel = 0.01f;
+    // MID360 pure-LiDAR fusion default: 1.5 cm.  A 5 mm voxel is below the
+    // sensor's range-dependent noise floor and mostly preserves measurement
+    // jitter instead of adding useful surface detail.  The explicit
+    // --lidar-map-voxel option remains available for close-range inspection.
+    float lidarMapVoxel = 0.015f;
     double minIcpFitness = 0.70;
     double maxIcpRmse = 0.18;
     double maxTranslationSpeed = 2.5;
@@ -93,9 +98,12 @@ struct Options {
     // gyro increment, otherwise a high fitness value is not pose evidence.
     double maxImuRotationCorrectionDeg = 8.0;
     bool startupStaticLock = true;
-    std::size_t fusionCachePoints = 250000;
-    std::size_t fusionMergeFanIn = 4;
-    double denoiseStd = 2.0;
+    // Larger bounded batches reduce VXF file count and multi-pass merge I/O.
+    // The batch is still bounded, so capture duration does not affect peak
+    // memory linearly.
+    std::size_t fusionCachePoints = 750000;
+    std::size_t fusionMergeFanIn = 8;
+    double denoiseStd = 1.8;
     // Legacy CLI compatibility: final filtering is now always spatially
     // streamed, regardless of total map size.
     std::size_t maxDenoisePoints = 3000000;
@@ -104,13 +112,28 @@ struct Options {
     // enough local surface statistics for pipe racks and outdoor structures.
     double denoiseTileSize = 4.0;
     double denoiseHalo = 0.20;
-    int denoiseMeanK = 24;
+    int denoiseMeanK = 20;
     // Remove only truly isolated fused points by default.  Requiring one
     // neighbour preserves narrow pipes, surface boundaries, and sparse far
     // range returns much better than an aggressive statistical filter.
-    double isolationRadius = 0.06;
-    int isolationMinNeighbors = 1;
+    double isolationRadius = 0.08;
+    int isolationMinNeighbors = 2;
     std::size_t maxIsolationPoints = 3000000;  // Legacy CLI compatibility.
+    // Edge-aware LiDAR cleanup: remove points that are far from a locally
+    // planar neighbourhood, while preserving non-planar pipes and thin
+    // structures. This is intentionally disabled for the RGB product.
+    bool edgePlaneDenoise = true;
+    int edgePlaneK = 20;
+    double edgePlaneResidual = 0.025;
+    double edgePlanarityRatio = 0.08;
+    // A second, uniform product for surface reconstruction. The dense
+    // lidar_registered.ply remains unchanged in intent; mesh_ready.ply avoids
+    // sending 1 cm repeated samples and isolated tips directly to a mesher.
+    float meshVoxel = 0.025f;
+    bool denseRgb = true;
+    // Optional normal export for surface reconstruction tools.
+    bool exportNormals = false;
+    float normalRadius = 0.08f;
     // Keep a recent verified submap for the front end.  Twelve frames is the
     // empirically stable default for the MID360 capture: it covers about
     // 1.2 s at 10 Hz without mixing too many repeated wall/pipe surfaces into
@@ -121,8 +144,20 @@ struct Options {
     double maxRange = 60.0;
     // Pseudo-colour limits for the pure LiDAR export. These are sensor-range
     // limits, not world-coordinate limits, so colours remain stable while moving.
-    double lidarColorNear = 1.0;
-    double lidarColorFar = 30.0;
+    // Pure-LiDAR pseudo-colour is referenced to the first device pose.  This
+    // is a world-space radius, so revisiting a place produces the same colour
+    // and a long walk does not reset the palette at every scan.
+    double lidarColorNear = 0.0;
+    double lidarColorFar = 180.0;
+    // Gamma below one expands the usually dense near-range part of a MID360
+    // scan, giving walls, pipes and fittings visibly different depth bands.
+    double lidarColorGamma = 0.62;
+    int lidarColorBands = 256;
+    // RGB is kept only for images with enough local edge energy.  Geometry is
+    // always retained and receives LiDAR depth colour when an image is
+    // rejected, so a blurred exposure cannot damage the map.
+    double minImageSharpness = 12.0;
+    std::size_t imageCacheSize = 6;
     int maxScans = 0;
     Vec3d gyroBias = Vec3d(kDefaultGyroBias[0], kDefaultGyroBias[1], kDefaultGyroBias[2]);
     bool gyroBiasOverride = false;
@@ -171,6 +206,10 @@ struct Options {
     // The preview is an intentionally decoupled, low-rate artifact.  It is
     // never used as a registration input and can be disabled for batch runs.
     bool preview = true;
+    // Resume only the disk-backed fusion/finalization stage from an existing
+    // .offline_fusion_cpp directory.  This is deliberately opt-in so a new
+    // reconstruction cannot accidentally mix stale chunks from an older run.
+    bool resumeFusion = false;
     // Publish about twice per second for a 10 Hz MID360 stream.  The viewer
     // itself renders at ~30 FPS between these snapshots.
     int previewInterval = 5;
@@ -2307,6 +2346,50 @@ public:
         if (pending_.size() >= cachePoints_) flush();
     }
 
+    // Recover source chunks left by an interrupted fusion or finalization.
+    // Only committed VXF files are accepted; .tmp files are ignored.  The
+    // caller can then run the normal spatial partition/filter/output path.
+    std::size_t restoreExisting() {
+        files_.clear();
+        std::vector<fs::path> recovered;
+        std::size_t nextSequence = 0;
+        if (!fs::is_directory(scratch_)) return 0;
+        const std::string prefix = name_ + "_";
+        for (const auto& entry : fs::directory_iterator(scratch_)) {
+            if (!entry.is_regular_file()) continue;
+            const auto filename = entry.path().filename().string();
+            if (entry.path().extension() != ".vxf" ||
+                filename.rfind(prefix, 0) != 0) continue;
+            // A filtered product is not an input chunk for this fusion.  It
+            // may be left by a crash during the denoise/write phase; the
+            // source tile chunks are authoritative and will be regenerated.
+            if (filename.rfind(name_ + "_filtered_", 0) == 0) continue;
+            try {
+                (void)chunkPointCount(entry.path());
+                recovered.push_back(entry.path());
+                const auto stem = entry.path().stem().string();
+                const auto separator = stem.find_last_of('_');
+                if (separator != std::string::npos && separator + 1 < stem.size()) {
+                    try {
+                        nextSequence = std::max(nextSequence,
+                            static_cast<std::size_t>(std::stoull(stem.substr(separator + 1)) + 1ULL));
+                    } catch (const std::exception&) {
+                        // A valid VXF with a non-numeric legacy suffix is still
+                        // recoverable; writeChunk will use the next known free
+                        // numeric sequence below.
+                    }
+                }
+            } catch (const std::exception& error) {
+                throw std::runtime_error("invalid recovery chunk " +
+                                         entry.path().string() + ": " + error.what());
+            }
+        }
+        std::sort(recovered.begin(), recovered.end());
+        files_ = std::move(recovered);
+        sequence_ = nextSequence;
+        return files_.size();
+    }
+
     std::vector<SpatialChunk> finalizeSpatial(double tileSize) {
         flush();
         if (files_.empty()) return {};
@@ -2483,6 +2566,74 @@ QImage loadImage(const fs::path& path) {
     return image.convertToFormat(QImage::Format_RGB888);
 }
 
+class ImageCache {
+public:
+    explicit ImageCache(std::size_t capacity) : capacity_(std::max<std::size_t>(1, capacity)) {}
+
+    bool get(const fs::path& path, QImage& image, double& sharpness) {
+        const std::string key = path.lexically_normal().string();
+        for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+            if (it->key != key) continue;
+            image = it->image;
+            sharpness = it->sharpness;
+            Entry entry = std::move(*it);
+            entries_.erase(it);
+            entries_.push_front(std::move(entry));
+            return !image.isNull();
+        }
+        Entry entry;
+        entry.key = key;
+        entry.image = loadImage(path);
+        entry.sharpness = entry.image.isNull() ? 0.0 : computeSharpness(entry.image);
+        image = entry.image;
+        sharpness = entry.sharpness;
+        entries_.push_front(std::move(entry));
+        while (entries_.size() > capacity_) entries_.pop_back();
+        return !image.isNull();
+    }
+
+private:
+    struct Entry {
+        std::string key;
+        QImage image;
+        double sharpness{};
+    };
+
+    static double computeSharpness(const QImage& source) {
+        // Work on a bounded grayscale image. The variance of a 4-neighbour
+        // Laplacian is cheap to compute and separates motion/defocus blur
+        // without making exposure or colour affect the decision.
+        const QImage gray = source.scaled(320, 240, Qt::KeepAspectRatio,
+                                          Qt::FastTransformation)
+                                  .convertToFormat(QImage::Format_Grayscale8);
+        if (gray.width() < 5 || gray.height() < 5) return 0.0;
+        long double sum = 0.0;
+        long double sumSq = 0.0;
+        std::size_t count = 0;
+        for (int y = 1; y + 1 < gray.height(); ++y) {
+            const auto* above = gray.constScanLine(y - 1);
+            const auto* row = gray.constScanLine(y);
+            const auto* below = gray.constScanLine(y + 1);
+            for (int x = 1; x + 1 < gray.width(); ++x) {
+                const int lap = 4 * static_cast<int>(row[x]) -
+                                static_cast<int>(row[x - 1]) -
+                                static_cast<int>(row[x + 1]) -
+                                static_cast<int>(above[x]) -
+                                static_cast<int>(below[x]);
+                sum += lap;
+                sumSq += static_cast<long double>(lap) * lap;
+                ++count;
+            }
+        }
+        if (count < 2) return 0.0;
+        const long double mean = sum / static_cast<long double>(count);
+        return static_cast<double>(sumSq / static_cast<long double>(count) - mean * mean);
+    }
+
+    std::size_t capacity_;
+    std::deque<Entry> entries_;
+};
+
 struct ImageProjection {
     double u{};
     double v{};
@@ -2555,7 +2706,8 @@ bool isVisibleInImage(const ImageProjection& projection, const std::vector<float
     return std::isfinite(nearest) && projection.depth <= nearest + std::max(0.06, projection.depth * 0.015);
 }
 
-std::array<float, 3> depthPseudoColor(float rangeMeters, double nearMeters, double farMeters);
+std::array<float, 3> depthPseudoColor(float rangeMeters, double nearMeters, double farMeters,
+                                      double gamma = 0.62, int bands = 64);
 
 std::vector<WeightedPoint> colorized(const std::vector<Vec3f>& localPoints, const Mat4f& pose,
                                      const ScanMeta& scan, const Calibration& calibration, const Options& options,
@@ -2570,7 +2722,8 @@ std::vector<WeightedPoint> colorized(const std::vector<Vec3f>& localPoints, cons
     for (const auto& local : localPoints) {
         Eigen::Vector4f homogeneous(local.x(), local.y(), local.z(), 1.0f);
         const Vec3f world = (pose * homogeneous).head<3>();
-        const auto fallback = depthPseudoColor(local.norm(), options.lidarColorNear, options.lidarColorFar);
+        const auto fallback = depthPseudoColor(world.norm(), options.lidarColorNear, options.lidarColorFar,
+                                               options.lidarColorGamma, options.lidarColorBands);
         std::array<std::uint8_t, 3> color{
             static_cast<std::uint8_t>(std::lround(fallback[0])),
             static_cast<std::uint8_t>(std::lround(fallback[1])),
@@ -2587,26 +2740,39 @@ std::vector<WeightedPoint> colorized(const std::vector<Vec3f>& localPoints, cons
     return geometry;
 }
 
-std::array<float, 3> depthPseudoColor(float rangeMeters, double nearMeters, double farMeters) {
-    // Turbo-like five-stop ramp: near = red, far = blue. Clamp rather than
-    // renormalizing per frame, otherwise the same surface changes colour as
-    // the scan moves and voxel fusion produces unstable colours.
-    const float t = std::clamp(static_cast<float>((rangeMeters - nearMeters) /
-                                                   std::max(0.001, farMeters - nearMeters)),
-                               0.0f, 1.0f);
-    constexpr std::array<std::array<float, 3>, 5> ramp{{
-        {{245.0f, 55.0f, 45.0f}},   // near: red
-        {{250.0f, 210.0f, 55.0f}},  // yellow
-        {{55.0f, 205.0f, 85.0f}},   // green
-        {{45.0f, 190.0f, 225.0f}},  // cyan
-        {{55.0f, 75.0f, 230.0f}}    // far: blue
-    }};
-    const float scaled = t * static_cast<float>(ramp.size() - 1);
-    const std::size_t index = std::min<std::size_t>(static_cast<std::size_t>(scaled), ramp.size() - 2);
-    const float blend = scaled - static_cast<float>(index);
-    return {ramp[index][0] + (ramp[index + 1][0] - ramp[index][0]) * blend,
-            ramp[index][1] + (ramp[index + 1][1] - ramp[index][1]) * blend,
-            ramp[index][2] + (ramp[index + 1][2] - ramp[index][2]) * blend};
+std::array<float, 3> depthPseudoColor(float rangeMeters, double nearMeters, double farMeters,
+                                      double gamma, int bands) {
+    // Fixed-range, high-resolution depth ramp: near = red, far = violet-blue.
+    // HSV gives hundreds of smoothly varying colours instead of a small set of
+    // hand-picked stops. Optional quantisation keeps neighbouring surfaces
+    // visually grouped while retaining far more depth bands than the old map.
+    float t = std::clamp(static_cast<float>((rangeMeters - nearMeters) /
+                                            std::max(0.001, farMeters - nearMeters)),
+                         0.0f, 1.0f);
+    t = std::pow(t, static_cast<float>(std::clamp(gamma, 0.15, 2.0)));
+    if (bands > 1) {
+        t = std::round(t * static_cast<float>(bands - 1)) /
+            static_cast<float>(bands - 1);
+    }
+    const float hue = std::clamp((1.0f - t) * 0.72f, 0.0f, 0.72f);
+    const float h = hue * 6.0f;
+    const int sector = std::min(5, static_cast<int>(std::floor(h)));
+    const float f = h - static_cast<float>(sector);
+    constexpr float saturation = 0.92f;
+    constexpr float value = 1.0f;
+    const float p = value * (1.0f - saturation);
+    const float q = value * (1.0f - saturation * f);
+    const float u = value * (1.0f - saturation * (1.0f - f));
+    float r{}, g{}, b{};
+    switch (sector) {
+        case 0: r = value; g = u; b = p; break;
+        case 1: r = q; g = value; b = p; break;
+        case 2: r = p; g = value; b = u; break;
+        case 3: r = p; g = q; b = value; break;
+        case 4: r = u; g = p; b = value; break;
+        default: r = value; g = p; b = q; break;
+    }
+    return {255.0f * r, 255.0f * g, 255.0f * b};
 }
 
 std::vector<WeightedPoint> depthColorizedLidar(const std::vector<Vec3f>& localPoints, const Mat4f& pose,
@@ -2615,7 +2781,8 @@ std::vector<WeightedPoint> depthColorizedLidar(const std::vector<Vec3f>& localPo
     result.reserve(localPoints.size());
     for (const Vec3f& local : localPoints) {
         const Vec3f world = (pose * Eigen::Vector4f(local.x(), local.y(), local.z(), 1.0f)).head<3>();
-        const auto rgb = depthPseudoColor(local.norm(), options.lidarColorNear, options.lidarColorFar);
+        const auto rgb = depthPseudoColor(world.norm(), options.lidarColorNear, options.lidarColorFar,
+                                          options.lidarColorGamma, options.lidarColorBands);
         result.push_back({world.x(), world.y(), world.z(), rgb[0], rgb[1], rgb[2], 1});
     }
     return result;
@@ -2633,18 +2800,26 @@ std::vector<WeightedPoint> motionCompensatedGeometry(const std::vector<LidarPoin
                                                       std::uint64_t scanDurationNs, const ScanMeta& scan,
                                                       const ImuPreintegrator& preintegrator,
                                                       const Calibration& calibration, const Options& options,
+                                                      ImageCache& imageCache,
                                                       int& projected, std::vector<WeightedPoint>* rgbOnly,
                                                       std::vector<WeightedPoint>* lidarOnly,
+                                                      bool* imageRejectedForBlur,
                                                       bool useDeskew,
                                                       const Vec3f& translationDeskewLocal,
                                                       const std::vector<offline_lio::MotionKnot>* lioMotion = nullptr,
                                                       const offline_lio::Config* lioConfig = nullptr) {
     projected = 0;
     QImage image;
+    if (imageRejectedForBlur) *imageRejectedForBlur = false;
     constexpr std::int64_t kMaxColorPairingNs = 300000000LL;
-    const bool hasImage = std::llabs(scan.imageDelta) <= kMaxColorPairingNs &&
-                          !scan.image.empty() && fs::is_regular_file(scan.image) &&
-                          !(image = loadImage(scan.image)).isNull();
+    double imageSharpness = 0.0;
+    bool hasImage = std::llabs(scan.imageDelta) <= kMaxColorPairingNs &&
+                    !scan.image.empty() && fs::is_regular_file(scan.image) &&
+                    imageCache.get(scan.image, image, imageSharpness);
+    if (hasImage && imageSharpness < options.minImageSharpness) {
+        hasImage = false;
+        if (imageRejectedForBlur) *imageRejectedForBlur = true;
+    }
     const double duration = static_cast<double>(std::max<std::uint64_t>(1, scanDurationNs));
     const int imageWidth = hasImage ? image.width() : 0;
     const int imageHeight = hasImage ? image.height() : 0;
@@ -2717,7 +2892,8 @@ std::vector<WeightedPoint> motionCompensatedGeometry(const std::vector<LidarPoin
         Vec3f local;
         Vec3f world;
         if (!localAndWorld(point, alpha, local, world)) continue;
-        const auto fallback = depthPseudoColor(local.norm(), options.lidarColorNear, options.lidarColorFar);
+        const auto fallback = depthPseudoColor(world.norm(), options.lidarColorNear, options.lidarColorFar,
+                                               options.lidarColorGamma, options.lidarColorBands);
         std::array<std::uint8_t, 3> color{
             static_cast<std::uint8_t>(std::lround(fallback[0])),
             static_cast<std::uint8_t>(std::lround(fallback[1])),
@@ -2730,8 +2906,9 @@ std::vector<WeightedPoint> motionCompensatedGeometry(const std::vector<LidarPoin
         geometry.push_back({world.x(), world.y(), world.z(), static_cast<float>(color[0]),
                             static_cast<float>(color[1]), static_cast<float>(color[2]), 1});
         if (lidarOnly) {
-            const auto depthColor = depthPseudoColor(local.norm(), options.lidarColorNear,
-                                                      options.lidarColorFar);
+            const auto depthColor = depthPseudoColor(world.norm(), options.lidarColorNear,
+                                                      options.lidarColorFar, options.lidarColorGamma,
+                                                      options.lidarColorBands);
             lidarOnly->push_back({world.x(), world.y(), world.z(), depthColor[0], depthColor[1],
                                   depthColor[2], 1});
         }
@@ -2760,7 +2937,8 @@ std::vector<WeightedPoint> motionCompensatedDepthLidar(const std::vector<LidarPo
         Vec3f world;
         if (!deskewedWorldPoint(point, timebase, preintegrator, calibration,
                                 startPose, endPose, alpha, local, world)) continue;
-        const auto rgb = depthPseudoColor(local.norm(), options.lidarColorNear, options.lidarColorFar);
+        const auto rgb = depthPseudoColor(world.norm(), options.lidarColorNear, options.lidarColorFar,
+                                          options.lidarColorGamma, options.lidarColorBands);
         result.push_back({world.x(), world.y(), world.z(), rgb[0], rgb[1], rgb[2], 1});
     }
     return result;
@@ -2917,15 +3095,143 @@ std::vector<WeightedPoint> removeIsolatedPoints(const std::vector<WeightedPoint>
     return output;
 }
 
-void writePly(const fs::path& path, const std::vector<WeightedPoint>& points, bool colors) {
+// Keep dense geometric edges and thin structures, but reject points that sit
+// well outside an otherwise locally planar surface. Radius/SOR filters alone
+// cannot remove this class of edge noise because the noise points still have
+// plenty of neighbours. The query cloud includes the tile halo; only core
+// indices are eligible for removal.
+pcl::Indices edgeAwarePlaneIndices(const pcl::PointCloud<pcl::PointXYZ>& cloud,
+                                   const pcl::Indices& candidates,
+                                   int requestedK, double maxResidual,
+                                   double planarityRatio,
+                                   std::size_t& removed) {
+    removed = 0;
+    if (cloud.size() < 8 || candidates.size() < 32 || requestedK < 6 ||
+        !std::isfinite(maxResidual) || maxResidual <= 0.0 ||
+        !std::isfinite(planarityRatio) || planarityRatio <= 0.0) {
+        return candidates;
+    }
+    pcl::KdTreeFLANN<pcl::PointXYZ> tree;
+    tree.setInputCloud(cloud.makeShared());
+    const int k = std::min<int>(requestedK, static_cast<int>(cloud.size()) - 1);
+    std::vector<int> neighbours(static_cast<std::size_t>(k + 1));
+    std::vector<float> distances(static_cast<std::size_t>(k + 1));
+    pcl::Indices kept;
+    kept.reserve(candidates.size());
+    for (const int candidate : candidates) {
+        if (candidate < 0 || static_cast<std::size_t>(candidate) >= cloud.size()) continue;
+        const auto& point = cloud[static_cast<std::size_t>(candidate)];
+        const int found = tree.nearestKSearch(point, k + 1, neighbours, distances);
+        if (found < 7) {
+            kept.push_back(candidate);
+            continue;
+        }
+
+        Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+        int used = 0;
+        for (int i = 0; i < found; ++i) {
+            const int index = neighbours[static_cast<std::size_t>(i)];
+            if (index == candidate || index < 0 || static_cast<std::size_t>(index) >= cloud.size()) continue;
+            const auto& neighbour = cloud[static_cast<std::size_t>(index)];
+            centroid += Eigen::Vector3d(neighbour.x, neighbour.y, neighbour.z);
+            ++used;
+        }
+        if (used < 6) {
+            kept.push_back(candidate);
+            continue;
+        }
+        centroid /= static_cast<double>(used);
+        Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+        for (int i = 0; i < found; ++i) {
+            const int index = neighbours[static_cast<std::size_t>(i)];
+            if (index == candidate || index < 0 || static_cast<std::size_t>(index) >= cloud.size()) continue;
+            const auto& neighbour = cloud[static_cast<std::size_t>(index)];
+            const Eigen::Vector3d delta = Eigen::Vector3d(neighbour.x, neighbour.y, neighbour.z) - centroid;
+            covariance.noalias() += delta * delta.transpose();
+        }
+        covariance /= static_cast<double>(used);
+        const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(covariance);
+        if (solver.info() != Eigen::Success) {
+            kept.push_back(candidate);
+            continue;
+        }
+        const Eigen::Vector3d eigenvalues = solver.eigenvalues();
+        const double total = eigenvalues.sum();
+        if (!std::isfinite(total) || total <= 1e-10) {
+            kept.push_back(candidate);
+            continue;
+        }
+        // At a real geometric edge the neighbourhood is not planar. Such
+        // points are retained even when their distance is comparatively high.
+        const double localPlanarity = eigenvalues[0] / total;
+        if (!std::isfinite(localPlanarity) || localPlanarity > planarityRatio) {
+            kept.push_back(candidate);
+            continue;
+        }
+        const Eigen::Vector3d normal = solver.eigenvectors().col(0);
+        const Eigen::Vector3d query(point.x, point.y, point.z);
+        const double residual = std::abs(normal.dot(query - centroid));
+        if (!std::isfinite(residual) || residual <= maxResidual) {
+            kept.push_back(candidate);
+            continue;
+        }
+        ++removed;
+    }
+
+    // A wrong normal estimate in a sparse tile must never erase most of a
+    // surface. Fall back to the original candidates if the gate is too broad.
+    if (removed > candidates.size() / 3) {
+        removed = 0;
+        return candidates;
+    }
+    return kept;
+}
+
+std::vector<Vec3f> estimateOutputNormals(const std::vector<WeightedPoint>& points,
+                                         float radius) {
+    std::vector<Vec3f> normals(points.size(), Vec3f(0.0f, 0.0f, 0.0f));
+    if (points.size() < 3 || !std::isfinite(radius) || radius <= 0.0f) return normals;
+
+    auto cloud = std::make_shared<Cloud>();
+    cloud->reserve(points.size());
+    for (const auto& point : points) cloud->push_back({point.x, point.y, point.z});
+
+    pcl::NormalEstimation<pcl::PointXYZ, pcl::Normal> estimator;
+    estimator.setInputCloud(cloud);
+    estimator.setSearchMethod(std::make_shared<pcl::search::KdTree<pcl::PointXYZ>>());
+    estimator.setRadiusSearch(std::max(0.02f, radius));
+    // A fixed viewpoint gives deterministic signs for each streamed tile. A
+    // downstream Poisson/MST pass may still reorient normals globally.
+    estimator.setViewPoint(0.0f, 0.0f, 0.0f);
+    auto estimated = std::make_shared<pcl::PointCloud<pcl::Normal>>();
+    estimator.compute(*estimated);
+    if (estimated->size() != points.size()) return normals;
+    for (std::size_t i = 0; i < estimated->size(); ++i) {
+        const auto& normal = (*estimated)[i];
+        const Vec3f value(normal.normal_x, normal.normal_y, normal.normal_z);
+        if (value.allFinite() && value.squaredNorm() > 1e-8f) {
+            normals[i] = value.normalized();
+        }
+    }
+    return normals;
+}
+
+void writePly(const fs::path& path, const std::vector<WeightedPoint>& points, bool colors,
+              bool includeNormals = false, float normalRadius = 0.08f) {
+    const auto normals = includeNormals ? estimateOutputNormals(points, normalRadius)
+                                        : std::vector<Vec3f>{};
     std::ofstream out(path, std::ios::binary);
     if (!out) throw std::runtime_error("cannot write " + path.string());
     out << "ply\nformat binary_little_endian 1.0\n";
     out << "element vertex " << points.size() << "\n";
     out << "property float x\nproperty float y\nproperty float z\n";
     if (colors) out << "property uchar red\nproperty uchar green\nproperty uchar blue\n";
+    if (includeNormals) {
+        out << "property float nx\nproperty float ny\nproperty float nz\n";
+    }
     out << "end_header\n";
-    for (const auto& point : points) {
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        const auto& point = points[i];
         out.write(reinterpret_cast<const char*>(&point.x), sizeof(float));
         out.write(reinterpret_cast<const char*>(&point.y), sizeof(float));
         out.write(reinterpret_cast<const char*>(&point.z), sizeof(float));
@@ -2936,14 +3242,19 @@ void writePly(const fs::path& path, const std::vector<WeightedPoint>& points, bo
                 static_cast<std::uint8_t>(std::clamp(std::lround(point.b), 0L, 255L))};
             out.write(reinterpret_cast<const char*>(rgb), 3);
         }
+        if (includeNormals) {
+            const Vec3f normal = i < normals.size() ? normals[i] : Vec3f::Zero();
+            out.write(reinterpret_cast<const char*>(normal.data()), 3 * sizeof(float));
+        }
     }
     out.flush();
     if (!out) throw std::runtime_error("write failed for " + path.string());
 }
 
-void writePlyAtomic(const fs::path& path, const std::vector<WeightedPoint>& points, bool colors) {
+void writePlyAtomic(const fs::path& path, const std::vector<WeightedPoint>& points, bool colors,
+                    bool includeNormals = false, float normalRadius = 0.08f) {
     const fs::path temporary = path.string() + ".tmp";
-    writePly(temporary, points, colors);
+    writePly(temporary, points, colors, includeNormals, normalRadius);
     std::error_code ec;
     const auto size = fs::file_size(temporary, ec);
     if (ec || size < 64) {
@@ -2974,15 +3285,19 @@ void writePlyAtomic(const fs::path& path, const std::vector<WeightedPoint>& poin
 struct StreamingProductStats {
     std::uint64_t beforeIsolation{};
     std::uint64_t afterIsolation{};
+    std::uint64_t afterEdgePlane{};
+    std::uint64_t edgePlaneRemoved{};
     std::uint64_t afterDenoise{};
     bool isolationApplied{};
+    bool edgePlaneApplied{};
     bool denoiseApplied{};
     std::size_t tileCount{};
 };
 
 void writePlyChunksAtomic(const fs::path& path,
                           const std::vector<DiskVoxelFusion::SpatialChunk>& chunks,
-                          std::uint64_t pointCount) {
+                          std::uint64_t pointCount, bool includeNormals = false,
+                          float normalRadius = 0.08f) {
     const fs::path temporary = path.string() + ".tmp";
     std::ofstream out(temporary, std::ios::binary);
     if (!out) throw std::runtime_error("cannot write " + temporary.string());
@@ -2990,14 +3305,20 @@ void writePlyChunksAtomic(const fs::path& path,
     out << "element vertex " << pointCount << "\n";
     out << "property float x\nproperty float y\nproperty float z\n";
     out << "property uchar red\nproperty uchar green\nproperty uchar blue\n";
+    if (includeNormals) {
+        out << "property float nx\nproperty float ny\nproperty float nz\n";
+    }
     out << "end_header\n";
     std::uint64_t written = 0;
     for (const auto& chunk : chunks) {
         const auto points = DiskVoxelFusion::readChunk(chunk.path);
+        const auto normals = includeNormals ? estimateOutputNormals(points, normalRadius)
+                                            : std::vector<Vec3f>{};
         if (points.size() != chunk.count) {
             throw std::runtime_error("filtered chunk count changed: " + chunk.path.string());
         }
-        for (const auto& point : points) {
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            const auto& point = points[i];
             out.write(reinterpret_cast<const char*>(&point.x), sizeof(float));
             out.write(reinterpret_cast<const char*>(&point.y), sizeof(float));
             out.write(reinterpret_cast<const char*>(&point.z), sizeof(float));
@@ -3006,6 +3327,10 @@ void writePlyChunksAtomic(const fs::path& path,
                 static_cast<std::uint8_t>(std::clamp(std::lround(point.g), 0L, 255L)),
                 static_cast<std::uint8_t>(std::clamp(std::lround(point.b), 0L, 255L))};
             out.write(reinterpret_cast<const char*>(rgb), 3);
+            if (includeNormals) {
+                const Vec3f normal = i < normals.size() ? normals[i] : Vec3f::Zero();
+                out.write(reinterpret_cast<const char*>(normal.data()), 3 * sizeof(float));
+            }
         }
         written += static_cast<std::uint64_t>(points.size());
     }
@@ -3048,7 +3373,10 @@ StreamingProductStats finalizeProductStreaming(DiskVoxelFusion& fusion,
                                                const char* name,
                                                const fs::path& output,
                                                const fs::path& scratch,
-                                               const Options& options) {
+                                               const Options& options,
+                                               bool cleanupFusion = true,
+                                               const fs::path& meshOutput = {},
+                                               float meshVoxel = 0.0f) {
     auto tiles = fusion.finalizeSpatial(options.denoiseTileSize);
     StreamingProductStats stats;
     stats.tileCount = tiles.size();
@@ -3060,8 +3388,15 @@ StreamingProductStats finalizeProductStreaming(DiskVoxelFusion& fusion,
 
     const bool useIsolation = options.isolationRadius > 0.0 &&
                               options.isolationMinNeighbors > 0;
+    // Edge-aware filtering is for the pure LiDAR geometry product only. RGB
+    // remains governed by its original projection/colour filtering path.
+    const bool useEdgePlane = name == std::string("lidar") &&
+                              options.edgePlaneDenoise && options.edgePlaneK >= 6 &&
+                              options.edgePlaneResidual > 0.0 &&
+                              options.edgePlanarityRatio > 0.0;
     const bool useDenoise = options.denoiseStd > 0.0 && options.denoiseMeanK >= 2;
     stats.isolationApplied = useIsolation && !tiles.empty();
+    stats.edgePlaneApplied = useEdgePlane && !tiles.empty();
     stats.denoiseApplied = useDenoise && !tiles.empty();
     const double halo = std::max(useIsolation ? options.isolationRadius : 0.0,
                                  useDenoise ? options.denoiseHalo : 0.0);
@@ -3071,6 +3406,10 @@ StreamingProductStats finalizeProductStreaming(DiskVoxelFusion& fusion,
 
     std::vector<DiskVoxelFusion::SpatialChunk> filteredTiles;
     filteredTiles.reserve(tiles.size());
+    std::vector<DiskVoxelFusion::SpatialChunk> meshTiles;
+    const bool writeMeshProduct = !meshOutput.empty() && std::isfinite(meshVoxel) && meshVoxel > 0.0f;
+    if (writeMeshProduct) meshTiles.reserve(tiles.size());
+    std::uint64_t meshPointCount = 0;
     for (std::size_t tileId = 0; tileId < tiles.size(); ++tileId) {
         const auto& tile = tiles[tileId];
         auto sourcePoints = DiskVoxelFusion::readChunk(tile.path);
@@ -3121,6 +3460,18 @@ StreamingProductStats finalizeProductStreaming(DiskVoxelFusion& fusion,
         }
         stats.afterIsolation += static_cast<std::uint64_t>(candidates->size());
 
+        if (useEdgePlane && candidates->size() >= 32) {
+            std::size_t removed = 0;
+            auto edgeKept = edgeAwarePlaneIndices(*cloud, *candidates,
+                                                  options.edgePlaneK,
+                                                  options.edgePlaneResidual,
+                                                  options.edgePlanarityRatio,
+                                                  removed);
+            candidates = pcl::IndicesPtr(new pcl::Indices(std::move(edgeKept)));
+            stats.edgePlaneRemoved += static_cast<std::uint64_t>(removed);
+        }
+        stats.afterEdgePlane += static_cast<std::uint64_t>(candidates->size());
+
         if (useDenoise && candidates->size() >= 32 &&
             cloud->size() > static_cast<std::size_t>(options.denoiseMeanK)) {
             pcl::StatisticalOutlierRemoval<pcl::PointXYZ> filter;
@@ -3147,20 +3498,45 @@ StreamingProductStats finalizeProductStreaming(DiskVoxelFusion& fusion,
         DiskVoxelFusion::writeStandaloneChunk(filteredPath, filtered);
         filteredTiles.push_back({tile.key, filteredPath,
                                  static_cast<std::uint64_t>(filtered.size())});
+        if (writeMeshProduct) {
+            // The mesh product is deliberately made after outlier removal.
+            // reduceVoxels uses global voxel keys, and the 4 m tile size is an
+            // exact multiple of the default 2.5 cm mesh voxel, so adjacent
+            // tiles cannot create duplicate boundary samples.
+            const auto meshPoints = reduceVoxels(filtered, meshVoxel);
+            const fs::path meshPath = scratch /
+                (std::string(name) + "_mesh_filtered_" + std::to_string(tileId) + ".vxf");
+            DiskVoxelFusion::writeStandaloneChunk(meshPath, meshPoints);
+            meshPointCount += static_cast<std::uint64_t>(meshPoints.size());
+            meshTiles.push_back({tile.key, meshPath,
+                                 static_cast<std::uint64_t>(meshPoints.size())});
+        }
         if (tileId == 0 || (tileId + 1) % 25 == 0 || tileId + 1 == tiles.size()) {
             std::cout << name << " filter tile " << tileId + 1 << "/" << tiles.size() << '\n';
         }
     }
 
-    writePlyChunksAtomic(output, filteredTiles, stats.afterDenoise);
+    writePlyChunksAtomic(output, filteredTiles, stats.afterDenoise,
+                         options.exportNormals, options.normalRadius);
+    if (writeMeshProduct) {
+        writePlyChunksAtomic(meshOutput, meshTiles, meshPointCount,
+                             options.exportNormals, options.normalRadius);
+    }
     std::error_code ec;
     for (const auto& tile : filteredTiles) fs::remove(tile.path, ec);
-    fusion.cleanup();
+    for (const auto& tile : meshTiles) fs::remove(tile.path, ec);
+    if (cleanupFusion) fusion.cleanup();
     std::cout << name << " streaming isolation removed "
               << (stats.beforeIsolation - stats.afterIsolation) << " / "
-              << stats.beforeIsolation << " points; statistical denoise removed "
-              << (stats.afterIsolation - stats.afterDenoise) << " / "
-              << stats.afterIsolation << " points across " << stats.tileCount << " tiles\n";
+              << stats.beforeIsolation << " points";
+    if (stats.edgePlaneApplied) std::cout << "; edge-plane removed "
+                                          << stats.edgePlaneRemoved << " points";
+    std::cout << "; statistical denoise removed "
+              << (stats.afterEdgePlane - stats.afterDenoise) << " / "
+              << stats.afterEdgePlane << " points across " << stats.tileCount << " tiles";
+    if (writeMeshProduct) std::cout << "; mesh product " << meshPointCount
+                                    << " points at voxel " << meshVoxel << " m";
+    std::cout << '\n';
     return stats;
 }
 
@@ -4485,13 +4861,18 @@ Options parseOptions(int argc, char** argv) {
         std::cout << "usage: offline_reconstruct_cpp ROOT --output OUT.ply [options]\n"
                   << "  --icp-voxel M --map-voxel M --lidar-map-voxel M\n"
                   << "  --max-scans N --denoise-std S --isolation-radius M --isolation-min-neighbors N\n"
+                  << "  --no-edge-plane-denoise --edge-plane-k N --edge-plane-residual M\n"
                   << "  --point-to-plane (default adaptive voxel-plane front end) --gicp --eskf-prediction\n"
                   << "  --max-imu-rotation-correction DEG --no-startup-static-lock\n"
                   << "  --keyframe-stride N --max-pose-graph-keyframes N --no-pose-graph\n"
                   << "  --final-refinement (default) --no-final-refinement\n"
                   << "  --btc-loop (default) --no-btc-loop --btc-max-candidates N --btc-min-separation N\n"
                   << "  --btc-similarity S --btc-icp-threshold S --btc-voxel M\n"
-                  << "  --preview-dir DIR --preview-interval N --preview-voxel M --no-preview\n";
+                   << "  --lidar-color-gamma G --min-image-sharpness S --image-cache-size N\n"
+                   << "  --lidar-color-bands N\n"
+                   << "  --export-normals --normal-radius M\n"
+                   << "  --preview-dir DIR --preview-interval N --preview-voxel M --no-preview\n"
+                  << "  --resume-fusion (recover existing .offline_fusion_cpp chunks)\n";
         std::exit(0);
     }
     Options options;
@@ -4508,10 +4889,20 @@ Options parseOptions(int argc, char** argv) {
         else if (arg == "--lidar-map-voxel") options.lidarMapVoxel = std::stof(next());
         else if (arg == "--lidar-color-near") options.lidarColorNear = std::stod(next());
         else if (arg == "--lidar-color-far") options.lidarColorFar = std::stod(next());
+        else if (arg == "--lidar-color-gamma") options.lidarColorGamma = std::stod(next());
+        else if (arg == "--lidar-color-bands") options.lidarColorBands = std::stoi(next());
+        else if (arg == "--export-normals") options.exportNormals = true;
+        else if (arg == "--normal-radius") options.normalRadius = std::stof(next());
+        else if (arg == "--min-image-sharpness") options.minImageSharpness = std::stod(next());
+        else if (arg == "--image-cache-size") options.imageCacheSize = static_cast<std::size_t>(std::stoull(next()));
         else if (arg == "--min-icp-fitness") options.minIcpFitness = std::stod(next());
         else if (arg == "--max-icp-rmse") options.maxIcpRmse = std::stod(next());
         else if (arg == "--max-scans") options.maxScans = std::stoi(next());
         else if (arg == "--denoise-std") options.denoiseStd = std::stod(next());
+        else if (arg == "--no-edge-plane-denoise") options.edgePlaneDenoise = false;
+        else if (arg == "--edge-plane-k") options.edgePlaneK = std::stoi(next());
+        else if (arg == "--edge-plane-residual") options.edgePlaneResidual = std::stod(next());
+        else if (arg == "--edge-planarity-ratio") options.edgePlanarityRatio = std::stod(next());
         else if (arg == "--max-denoise-points") options.maxDenoisePoints = static_cast<std::size_t>(std::stoull(next()));
         else if (arg == "--denoise-tile-size") options.denoiseTileSize = std::stod(next());
         else if (arg == "--denoise-halo") options.denoiseHalo = std::stod(next());
@@ -4553,6 +4944,7 @@ Options parseOptions(int argc, char** argv) {
         else if (arg == "--preview-voxel") options.previewVoxel = std::stof(next());
         else if (arg == "--preview-max-points") options.previewMaxPoints = static_cast<std::size_t>(std::stoull(next()));
         else if (arg == "--no-preview") options.preview = false;
+        else if (arg == "--resume-fusion") options.resumeFusion = true;
         else if (arg == "--no-pose-graph") options.poseGraph = false;
         else if (arg == "--pose-graph") options.poseGraph = true;
         else if (arg == "--final-refinement") options.finalPoseRefinement = true;
@@ -4561,6 +4953,7 @@ Options parseOptions(int argc, char** argv) {
             std::cout << "usage: offline_reconstruct_cpp ROOT --output OUT.ply [options]\n"
                       << "  --icp-voxel M --map-voxel M --lidar-map-voxel M\n"
                       << "  --max-scans N --denoise-std S --isolation-radius M --isolation-min-neighbors N\n"
+                      << "  --no-edge-plane-denoise --edge-plane-k N --edge-plane-residual M --edge-planarity-ratio R\n"
                       << "  --max-denoise-points N --denoise-tile-size M --denoise-halo M --denoise-mean-k N\n"
                       << "  --max-isolation-points N --local-map-frames N\n"
                       << "  --lidar-color-near M --lidar-color-far M --no-pose-graph\n"
@@ -4571,8 +4964,12 @@ Options parseOptions(int argc, char** argv) {
                       << "  --final-refinement (default) --no-final-refinement\n"
                       << "  --btc-loop (default) --no-btc-loop --btc-max-candidates N --btc-min-separation N\n"
                       << "  --btc-similarity S --btc-icp-threshold S --btc-voxel M\n"
+                      << "  --lidar-color-gamma G --min-image-sharpness S --image-cache-size N\n"
+                      << "  --lidar-color-bands N\n"
+                      << "  --export-normals --normal-radius M\n"
                       << "  --preview-dir DIR --preview-interval N --preview-voxel M\n"
                       << "  --preview-max-points N --no-preview\n";
+            std::cout << "  --resume-fusion (recover existing .offline_fusion_cpp chunks)\n";
             std::exit(0);
         } else throw std::runtime_error("unknown option " + arg);
     }
@@ -4586,12 +4983,31 @@ Options parseOptions(int argc, char** argv) {
     if (options.denoiseTileSize <= 0.0 || options.denoiseHalo < 0.0 || options.denoiseMeanK < 2) {
         throw std::runtime_error("denoise tile, halo and mean-k parameters are invalid");
     }
+    if (options.edgePlaneK < 6 || options.edgePlaneResidual <= 0.0 ||
+        !std::isfinite(options.edgePlaneResidual) || options.edgePlanarityRatio <= 0.0 ||
+        !std::isfinite(options.edgePlanarityRatio) || options.edgePlanarityRatio >= 1.0) {
+        throw std::runtime_error("edge-plane denoise parameters are invalid");
+    }
     if (options.icpVoxel <= 0 || options.mapVoxel <= 0 || options.lidarMapVoxel <= 0) throw std::runtime_error("voxel sizes must be positive");
     if (options.maxImuRotationCorrectionDeg <= 0.0 || options.maxImuRotationCorrectionDeg > 45.0) {
         throw std::runtime_error("--max-imu-rotation-correction must be in (0, 45]");
     }
     if (options.lidarColorNear < 0 || options.lidarColorFar <= options.lidarColorNear) {
         throw std::runtime_error("lidar colour range requires 0 <= --lidar-color-near < --lidar-color-far");
+    }
+    if (!std::isfinite(options.lidarColorGamma) || options.lidarColorGamma <= 0.0 ||
+        options.lidarColorGamma > 2.0) {
+        throw std::runtime_error("--lidar-color-gamma must be in (0, 2]");
+    }
+    if (options.lidarColorBands < 2 || options.lidarColorBands > 4096) {
+        throw std::runtime_error("--lidar-color-bands must be in [2, 4096]");
+    }
+    if (!std::isfinite(options.normalRadius) || options.normalRadius <= 0.0f) {
+        throw std::runtime_error("--normal-radius must be finite and positive");
+    }
+    if (!std::isfinite(options.minImageSharpness) || options.minImageSharpness < 0.0 ||
+        options.imageCacheSize == 0) {
+        throw std::runtime_error("image sharpness threshold and cache size must be non-negative/positive");
     }
     if (options.isolationRadius < 0 || options.isolationMinNeighbors < 0) {
         throw std::runtime_error("isolation filter radius and neighbour count must be non-negative");
@@ -4627,6 +5043,7 @@ int main(int argc, char** argv) {
     fs::path activePreviewDir;
     fs::path activeScratch;
     bool activePreview = false;
+    bool preserveScratchOnError = false;
     try {
         QCoreApplication qtApp(argc, argv);
         // The CMake file copies qjpeg.dll beside the executable.  This also
@@ -4647,6 +5064,63 @@ int main(int argc, char** argv) {
         fs::create_directories(options.output.parent_path());
         const fs::path scratch = options.output.parent_path() / ".offline_fusion_cpp";
         activeScratch = scratch;
+
+        // A crashed run can leave the disk-backed fusion transaction almost
+        // complete.  In recovery mode do not touch the source chunks until
+        // they have been validated and the replacement PLY has been safely
+        // published.  The normal path remains destructive by design so stale
+        // chunks from an unrelated previous output directory cannot leak into
+        // a new map.
+        if (options.resumeFusion) {
+            preserveScratchOnError = true;
+            if (!fs::is_directory(scratch)) {
+                throw std::runtime_error("--resume-fusion requested but fusion scratch directory is missing: " + scratch.string());
+            }
+            auto removeStaleFiltered = [&]() {
+                std::error_code ec;
+                for (const auto& entry : fs::directory_iterator(scratch)) {
+                    if (!entry.is_regular_file() || entry.path().extension() != ".vxf") continue;
+                    const auto filename = entry.path().filename().string();
+                    if (filename.rfind("lidar_filtered_", 0) == 0 ||
+                        filename.rfind("rgb_filtered_", 0) == 0) {
+                        fs::remove(entry.path(), ec);
+                        ec.clear();
+                    }
+                }
+            };
+            removeStaleFiltered();
+            DiskVoxelFusion lidarFusion(scratch, "lidar_depth", options.lidarMapVoxel,
+                                        options.fusionCachePoints, options.fusionMergeFanIn);
+            DiskVoxelFusion rgbFusion(scratch, "rgb", options.mapVoxel,
+                                      options.fusionCachePoints, options.fusionMergeFanIn);
+            const std::size_t lidarChunks = lidarFusion.restoreExisting();
+            const std::size_t rgbChunks = rgbFusion.restoreExisting();
+            if (lidarChunks == 0) {
+                throw std::runtime_error("--resume-fusion found no valid lidar_depth VXF chunks in " + scratch.string());
+            }
+            std::cout << "resuming fusion from " << lidarChunks << " LiDAR chunks"
+                      << (rgbChunks ? (" and " + std::to_string(rgbChunks) + " RGB chunks") : "") << '\n';
+            const fs::path lidarOutput = options.output.parent_path() / "lidar_registered.ply";
+            const fs::path meshOutput = options.output.parent_path() / "mesh_ready.ply";
+            const auto lidarStats = finalizeProductStreaming(lidarFusion, "lidar", lidarOutput,
+                                                             scratch, options, false,
+                                                             meshOutput, options.meshVoxel);
+            StreamingProductStats rgbStats;
+            if (rgbChunks > 0) {
+                rgbStats = finalizeProductStreaming(rgbFusion, "RGB", options.output,
+                                                     scratch, options, false);
+            }
+            std::error_code staleGeometryError;
+            fs::remove(options.output.parent_path() / "geometry_registered.ply", staleGeometryError);
+            std::cout << "resumed fusion completed: lidar points=" << lidarStats.afterDenoise;
+            if (rgbChunks > 0) std::cout << ", rgb points=" << rgbStats.afterDenoise;
+            std::cout << '\n';
+            lidarFusion.cleanup();
+            rgbFusion.cleanup();
+            fs::remove_all(scratch);
+            preserveScratchOnError = false;
+            return 0;
+        }
         fs::remove_all(scratch);
 
         // Load the calibration snapshot before indexing RGB so the pairing
@@ -4716,13 +5190,21 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        // Never infer a static window from an old capture that did not record
-        // the initialization contract: slow constant motion can look like a
-        // stable gyro bias.  Only a capture-side, explicitly validated file
-        // is allowed to replace the configured fallback.
+        // Prefer the capture-side initialization contract. Older captures do
+        // not contain that sidecar, so run the same conservative estimator on
+        // their first ten seconds. It only becomes valid when the complete
+        // window passes the duration, gyro-noise and acceleration gates.
         if (!options.gyroBiasOverride && !calibration.imuInitialization.valid) {
-            std::cout << "warning: no valid imu_initialization.yaml; "
-                      << "using configured gyro bias\n";
+            const auto estimated = estimateStaticInitialization(dataset.imu());
+            if (estimated.valid) {
+                calibration.imuInitialization = estimated;
+                std::cout << "IMU initialization reconstructed from the first "
+                          << estimated.durationSec << " stationary seconds ("
+                          << estimated.sampleCount << " samples)\n";
+            } else {
+                std::cout << "warning: no valid imu_initialization.yaml and the first "
+                             "ten seconds are not stationary; using configured gyro bias\n";
+            }
         }
         const Vec3d appliedGyroBias = options.gyroBiasOverride
                                           ? options.gyroBias
@@ -5586,7 +6068,9 @@ int main(int argc, char** argv) {
         trajectoryByScan.reserve(trajectory.size());
         for (std::size_t i = 0; i < trajectory.size(); ++i) trajectoryByScan[trajectory[i].index] = i;
         std::uint64_t totalColored = 0;
+        std::uint64_t blurredImagesSkipped = 0;
         int fusionFailures = 0;
+        ImageCache imageCache(options.imageCacheSize);
         CloudPtr fusionPreviewAccum = std::make_shared<Cloud>();
         std::size_t fusionLastPublished = 0;
         dataset.streamScans([&](const ScanMeta& scan, const std::vector<LidarPoint>& raw) {
@@ -5616,13 +6100,17 @@ int main(int argc, char** argv) {
                 std::vector<WeightedPoint> rgbOnly;
                 std::vector<WeightedPoint> lidarOnly;
                 int projected = 0;
+                bool imageRejectedForBlur = false;
                 auto geometry = motionCompensatedGeometry(raw, startPose, scanDurationNs,
                                                            scan, preintegrator, calibration, options,
+                                                           imageCache,
                                                            projected, &rgbOnly, &lidarOnly,
+                                                           &imageRejectedForBlur,
                                                            !accepted[acceptedId].usedRawFallback,
                                                            accepted[acceptedId].translationDeskewLocal,
                                                            useFastLio ? &accepted[acceptedId].lioMotion : nullptr,
                                                            useFastLio ? &fastLioConfig : nullptr);
+                if (imageRejectedForBlur) ++blurredImagesSkipped;
                 if (options.preview) {
                     for (const auto& point : geometry) {
                         fusionPreviewAccum->push_back(pcl::PointXYZ(point.x, point.y, point.z));
@@ -5674,9 +6162,11 @@ int main(int argc, char** argv) {
         // Finalize directly from disk tiles.  Neither product is materialized
         // as one process-wide vector, so peak memory depends on local scene
         // density rather than capture duration or total map size.
-        const fs::path lidarOutput = options.output.parent_path() / "lidar_registered.ply";
+            const fs::path lidarOutput = options.output.parent_path() / "lidar_registered.ply";
+        const fs::path meshOutput = options.output.parent_path() / "mesh_ready.ply";
         const auto lidarStats = finalizeProductStreaming(lidarFusion, "lidar", lidarOutput,
-                                                         scratch, options);
+                                                         scratch, options, true,
+                                                         meshOutput, options.meshVoxel);
         const auto rgbStats = finalizeProductStreaming(rgbFusion, "RGB", options.output,
                                                        scratch, options);
         // Older builds produced a third mixed-colour geometry product.  It is
@@ -5731,6 +6221,8 @@ int main(int argc, char** argv) {
               << "  \"rgb_points_before_isolation\": " << rgbStats.beforeIsolation << ",\n"
               << "  \"lidar_isolation_removed\": "
               << (lidarStats.beforeIsolation - lidarStats.afterIsolation) << ",\n"
+              << "  \"lidar_edge_plane_removed\": "
+              << lidarStats.edgePlaneRemoved << ",\n"
               << "  \"rgb_isolation_removed\": "
               << (rgbStats.beforeIsolation - rgbStats.afterIsolation) << ",\n"
               << "  \"lidar_points_after_isolation\": " << lidarStats.afterIsolation << ",\n"
@@ -5757,6 +6249,8 @@ int main(int argc, char** argv) {
               << "  \"imu_applied_timestamp_correction_s\": "
               << static_cast<double>(dataset.imuClockOffsetNs()) * 1e-9 << ",\n"
               << "  \"rgb_pairing_outliers_over_0_30s\": " << rgbPairingOutliers << ",\n"
+              << "  \"blurred_rgb_scans_skipped\": " << blurredImagesSkipped << ",\n"
+              << "  \"min_image_sharpness\": " << options.minImageSharpness << ",\n"
               << "  \"local_map_frames\": " << options.localMapFrames << ",\n"
               << "  \"pose_graph_keyframe_stride\": " << effectiveKeyframeStride << ",\n"
               << "  \"pose_graph_keyframes\": " << poseGraphKeyframeCount << ",\n"
@@ -5787,6 +6281,12 @@ int main(int argc, char** argv) {
               << "  \"quality_graph\": \"registration_quality.svg\",\n"
               << "  \"isolation_radius_m\": " << options.isolationRadius << ",\n"
               << "  \"isolation_min_neighbors\": " << options.isolationMinNeighbors << ",\n"
+              << "  \"lidar_color_near_m\": " << options.lidarColorNear << ",\n"
+              << "  \"lidar_color_far_m\": " << options.lidarColorFar << ",\n"
+              << "  \"lidar_color_gamma\": " << options.lidarColorGamma << ",\n"
+              << "  \"lidar_color_bands\": " << options.lidarColorBands << ",\n"
+              << "  \"export_normals\": " << (options.exportNormals ? "true" : "false") << ",\n"
+              << "  \"normal_radius_m\": " << options.normalRadius << ",\n"
               << "  \"isolation_applied\": "
               << ((lidarStats.isolationApplied || rgbStats.isolationApplied) ? "true" : "false") << ",\n"
               << "  \"denoise_applied\": "
@@ -5805,13 +6305,15 @@ int main(int argc, char** argv) {
         return 0;
     } catch (const std::exception& error) {
         if (activePreview) writePreviewErrorArtifact(activePreviewDir, error.what());
-        if (!activeScratch.empty()) {
+        if (!activeScratch.empty() && !preserveScratchOnError) {
             std::error_code cleanupError;
             fs::remove_all(activeScratch, cleanupError);
             if (cleanupError) {
                 std::cerr << "warning: failed to clean fusion scratch: "
                           << cleanupError.message() << '\n';
             }
+        } else if (preserveScratchOnError && !activeScratch.empty()) {
+            std::cerr << "fusion scratch preserved for retry: " << activeScratch << '\n';
         }
         std::cerr << "ERROR: " << error.what() << '\n';
         return 1;
